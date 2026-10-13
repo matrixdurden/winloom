@@ -35,6 +35,7 @@ use windows::core::w;
 //   winloom --audio-test   Ses aygıtları aracının gördüğü çıkışları ve medya oturumlarını yazdır
 //   winloom --dock-test    dock'un gördüğü pencereleri ve dock'taki öğeleri yazdır
 //   winloom --dock-pin <yol>  dock'a sabitle (sağ tık menüsünden)
+//   winloom --lights-test  ışığı ara, bağlan, renkleri sırayla göster
 
 /// Bayrak İngilizce ya da Türkçe adıyla verilmiş mi.
 fn flag(args: &[String], en: &str, tr: &str) -> bool {

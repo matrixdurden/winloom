@@ -505,9 +505,31 @@ pub fn cli_test() -> i32 {
             println!("\nBulundu: {n} ({a:012X}, model {}). Bağlanılıyor…", m.id);
             let status = Arc::new(Mutex::new(Status { model: Some(m), ..Default::default() }));
             match Conn::open(a, &status, 0) {
-                Ok(c) => {
+                Ok(mut c) => {
                     println!("Bağlandı. Komut kanalı: {:?}, cevaplı yazma: {}", m.write, c.with_response);
-                    0
+                    // Işık gözle görülür bir sıra oynar: aç, kırmızı, yeşil, mavi, beyaz, efekt.
+                    let steps = [
+                        Cmd::Power(true),
+                        Cmd::Brightness(1.0),
+                        Cmd::Color([255, 0, 0]),
+                        Cmd::Color([0, 255, 0]),
+                        Cmd::Color([0, 0, 255]),
+                        Cmd::Color([255, 255, 255]),
+                        Cmd::Effect(1),
+                    ];
+                    let mut failed = 0;
+                    for cmd in steps {
+                        let Some(p) = (m.encode)(cmd) else { continue };
+                        match c.write(&p) {
+                            Ok(()) => println!("  {cmd:?}: gönderildi"),
+                            Err(e) => {
+                                println!("  {cmd:?}: {e}");
+                                failed += 1;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(1200));
+                    }
+                    (failed > 0) as i32
                 }
                 Err(e) => {
                     println!("Bağlanılamadı: {e}");

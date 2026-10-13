@@ -1,13 +1,15 @@
 //! Yakalama: bütün ekranlar bir kez kopyalanır (donmuş görüntü), üstünde tam ekran bir pencere
 //! kararmış hâlini gösterir; seçilen alan aydınlık, ince çerçeveli; yazı yok. Seçim bırakılınca
-//! yerinde kalır: içinde tek renk kalemle çizilir, Ctrl+C (ya da Enter) panoya kopyalar, Ctrl+S
-//! kaydetme yerini sorup PNG olarak kaydeder (panoya da kopyalar), Ctrl+Z son çizgiyi geri alır,
-//! Esc vazgeçer; kenarından tutup sürüklemek (ya da ok tuşları, Shift ile 10 piksel) seçimi taşır,
-//! çizgiler görüntünün üstünde yerinde kalır; seçimin dışında sürüklemek yeni seçim başlatır. Fare kıpırdadıkça yalnızca
-//! değişen bölge yeniden çizilir (4K'da da akıcı). Açıkken öbür araçlar ekran köşelerine tepki
-//! vermez. Hepsi arayüz iş parçacığında, GDI.
+//! yerinde kalır ve altında küçük bir araç çubuğu çıkar: kalem, kare ve renkler. Araç seçili
+//! değilken seçimin içinden tutup sürüklemek onu taşır; kalem ya da kare seçiliyken içeride çizilir,
+//! kenar şeridinden tutmak yine taşır (ok tuşları da, Shift ile 10 piksel). Çizimler görüntünün
+//! üstünde yerinde kalır. Ctrl+C (ya da Enter) panoya kopyalar, Ctrl+S kaydetme yerini sorup PNG
+//! olarak kaydeder (panoya da kopyalar), Ctrl+Z son çizimi geri alır, Esc vazgeçer; seçimin
+//! dışında sürüklemek yeni seçim başlatır. Fare kıpırdadıkça yalnızca değişen bölge yeniden çizilir
+//! (4K'da da akıcı). Açıkken öbür araçlar ekran köşelerine tepki vermez. Hepsi arayüz iş
+//! parçacığında, GDI.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::*;
@@ -28,11 +30,55 @@ use ortak::util::wide;
 const CLASS: PCWSTR = w!("winloom-ekran-goruntusu");
 /// Karartma: donmuş görüntünün üstüne bu saydamlıkta siyah (0..255).
 const DIM: u8 = 110;
-/// Kalemin rengi (COLORREF 0x00BBGGRR: kırmızı) ve kalınlığı (DIP).
-const PEN: u32 = 0x003a45ff;
+/// Çizim renkleri (0xRRGGBB): kırmızı, sarı, yeşil, mavi, beyaz, siyah.
+const COLORS: [u32; 6] = [0xff453a, 0xffd60a, 0x32d74b, 0x0a84ff, 0xffffff, 0x1c1c1e];
+/// Çizginin kalınlığı (DIP).
 const PEN_W: i32 = 3;
 /// Seçimin taşımak için tutulan kenar şeridi, çerçevenin iki yanına (DIP).
-const GRIP: i32 = 8;
+const GRIP: i32 = 10;
+/// Araç çubuğu (DIP): düğme, aralık, kenar boşluğu, araçlarla renkler arası, seçimden uzaklık.
+const BTN: i32 = 32;
+const GAP: i32 = 2;
+const PAD: i32 = 4;
+const SEP: i32 = 10;
+const OFF: i32 = 8;
+
+thread_local! {
+    /// Seçilen renk sonraki yakalamada da seçili gelir.
+    static COLOR: Cell<usize> = const { Cell::new(0) };
+}
+
+/// COLORREF: 0x00BBGGRR.
+fn colorref(c: u32) -> COLORREF {
+    COLORREF(((c & 0xff) << 16) | (c & 0xff00) | (c >> 16))
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tool {
+    /// Seçili araç yok: seçimin içinden tutmak taşır.
+    Move,
+    Pen,
+    Rect,
+}
+
+/// Araç çubuğunda bir yer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bar {
+    Tool(Tool),
+    Color(usize),
+}
+
+enum Shape {
+    Pen(Vec<POINT>),
+    /// Köşeleri (sürüklenen ve karşısı).
+    Rect(POINT, POINT),
+}
+
+/// Çizilen bir şekil ve rengi (`COLORS` sırası).
+struct Mark {
+    shape: Shape,
+    color: usize,
+}
 
 /// Donmuş görüntü ve seçim (koordinatlar pencerenin, yani sanal ekranın köşesine göre piksel).
 struct Shot {
@@ -43,11 +89,17 @@ struct Shot {
     src: (HDC, HBITMAP),
     dim: (HDC, HBITMAP),
     buf: (HDC, HBITMAP),
-    /// Kalem (ekran pikseli kalınlığında).
-    pen: HPEN,
+    /// Her rengin kalemi (ekran pikseli kalınlığında).
+    pens: Vec<HPEN>,
     pen_w: i32,
-    /// Kenar şeridi (ekran pikseli).
-    grip: i32,
+    /// DIP → ekran pikseli.
+    dpi: i32,
+    /// Araç çubuğunun simge yazı tipi.
+    icons: HFONT,
+    tool: Tool,
+    color: usize,
+    /// İmlecin üstünde durduğu çubuk düğmesi.
+    hover: Option<Bar>,
     /// Sürüklenen seçimin başladığı yer.
     anchor: Option<POINT>,
     sel: Option<RECT>,
@@ -55,8 +107,8 @@ struct Shot {
     moving: Option<(POINT, RECT)>,
     /// Seçim bırakıldı: içinde çizilir, kısayollar çalışır.
     placed: bool,
-    /// Çizgiler (pencere pikseli); sonuncusu çizilmekte olabilir.
-    strokes: Vec<Vec<POINT>>,
+    /// Çizimler (pencere pikseli); sonuncusu çizilmekte olabilir.
+    marks: Vec<Mark>,
     drawing: bool,
     /// Kaydetme penceresinin ilk açtığı klasör.
     dir: PathBuf,
@@ -126,8 +178,23 @@ pub fn start(dir: PathBuf) {
         };
         let dpi = GetDpiForWindow(hwnd).max(96);
         let pen_w = (PEN_W * dpi as i32 / 96).max(2);
-        let pen = CreatePen(PS_SOLID, pen_w, COLORREF(PEN));
-        let grip = GRIP * dpi as i32 / 96;
+        let pens = COLORS.iter().map(|&c| CreatePen(PS_SOLID, pen_w, colorref(c))).collect();
+        let icons = CreateFontW(
+            -(16 * dpi as i32 / 96),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            0,
+            w!("Segoe MDL2 Assets"),
+        );
         SHOT.with_borrow_mut(|s| {
             *s = Some(Shot {
                 hwnd,
@@ -136,14 +203,18 @@ pub fn start(dir: PathBuf) {
                 src,
                 dim,
                 buf,
-                pen,
+                pens,
                 pen_w,
-                grip,
+                dpi: dpi as i32,
+                icons,
+                tool: Tool::Move,
+                color: COLOR.get(),
+                hover: None,
                 anchor: None,
                 sel: None,
                 moving: None,
                 placed: false,
-                strokes: Vec::new(),
+                marks: Vec::new(),
                 drawing: false,
                 dir,
             })
@@ -168,8 +239,21 @@ fn footprint(r: RECT) -> RECT {
     RECT { left: r.left - 2, top: r.top - 2, right: r.right + 2, bottom: r.bottom + 2 }
 }
 
+fn inside(r: RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+fn grow(r: RECT, d: i32) -> RECT {
+    RECT { left: r.left - d, top: r.top - d, right: r.right + d, bottom: r.bottom + d }
+}
+
 impl Shot {
-    /// Tamponun `area` bölgesini baştan kurar: karartılmış zemin, aydınlık seçim, çizgiler, çerçeve.
+    fn px(&self, dip: i32) -> i32 {
+        dip * self.dpi / 96
+    }
+
+    /// Tamponun `area` bölgesini baştan kurar: karartılmış zemin, aydınlık seçim, çizimler, çerçeve,
+    /// araç çubuğu.
     fn compose(&self, area: RECT) {
         unsafe {
             let (l, t) = (area.left.max(0), area.top.max(0));
@@ -181,84 +265,112 @@ impl Shot {
             let _ = BitBlt(dc, l, t, r - l, b - t, Some(self.dim.0), l, t, SRCCOPY);
             let Some(s) = self.sel else { return };
             let _ = BitBlt(dc, s.left, s.top, s.right - s.left, s.bottom - s.top, Some(self.src.0), s.left, s.top, SRCCOPY);
-            // Seçim taşınınca dışında kalan çizgiler görünmez (görüntüde yerlerinde dururlar).
+            // Seçim taşınınca dışında kalan çizimler görünmez (görüntüde yerlerinde dururlar).
             IntersectClipRect(dc, s.left, s.top, s.right, s.bottom);
-            self.draw_strokes(dc, 0, 0);
+            self.draw_marks(dc, 0, 0);
             SelectClipRgn(dc, None);
             let white = CreateSolidBrush(COLORREF(0x00ededed));
             let _ = FrameRect(dc, &s, white);
             let _ = DeleteObject(white.into());
+            self.paint_bar(dc);
         }
     }
 
-    /// Çizgileri `dc`'ye çizer; `(dx, dy)`: pencere pikselinden hedefe kaydırma.
-    fn draw_strokes(&self, dc: HDC, dx: i32, dy: i32) {
+    /// Çizimleri `dc`'ye çizer; `(dx, dy)`: pencere pikselinden hedefe kaydırma.
+    fn draw_marks(&self, dc: HDC, dx: i32, dy: i32) {
         unsafe {
-            let old = SelectObject(dc, self.pen.into());
-            for st in &self.strokes {
-                let Some(first) = st.first() else { continue };
-                let _ = MoveToEx(dc, first.x - dx, first.y - dy, None);
-                if st.len() == 1 {
-                    let _ = LineTo(dc, first.x - dx + 1, first.y - dy);
-                }
-                for p in &st[1..] {
-                    let _ = LineTo(dc, p.x - dx, p.y - dy);
+            let old_pen = SelectObject(dc, self.pens[0].into());
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            for m in &self.marks {
+                SelectObject(dc, self.pens[m.color].into());
+                match &m.shape {
+                    Shape::Pen(st) => {
+                        let Some(first) = st.first() else { continue };
+                        let _ = MoveToEx(dc, first.x - dx, first.y - dy, None);
+                        if st.len() == 1 {
+                            let _ = LineTo(dc, first.x - dx + 1, first.y - dy);
+                        }
+                        for p in &st[1..] {
+                            let _ = LineTo(dc, p.x - dx, p.y - dy);
+                        }
+                    }
+                    Shape::Rect(a, b) => {
+                        let r = norm(*a, *b);
+                        let _ = Rectangle(dc, r.left - dx, r.top - dy, r.right - dx, r.bottom - dy);
+                    }
                 }
             }
-            SelectObject(dc, old);
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
         }
     }
 
-    /// Çizginin son parçasını tampona ekler ve yalnızca o bölgeyi yeniden çizdirir.
-    fn add_point(&mut self, p: POINT) {
-        let Some(st) = self.strokes.last_mut() else { return };
-        let prev = *st.last().unwrap_or(&p);
-        st.push(p);
-        let m = self.pen_w + 2;
-        let area = RECT { left: prev.x.min(p.x) - m, top: prev.y.min(p.y) - m, right: prev.x.max(p.x) + m, bottom: prev.y.max(p.y) + m };
+    /// Bir şeklin kapladığı yer (kalem kalınlığı dahil).
+    fn mark_area(&self, a: POINT, b: POINT) -> RECT {
+        grow(norm(a, b), self.pen_w + 2)
+    }
+
+    fn redraw(&self, area: RECT) {
         self.compose(area);
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), Some(&area), false);
         }
     }
 
-    /// Son çizgiyi geri alır.
+    /// Çizilmekte olan şekli `p`'ye uzatır ve yalnızca değişen bölgeyi yeniden çizdirir.
+    fn extend(&mut self, p: POINT) {
+        let Some(m) = self.marks.last_mut() else { return };
+        let area = match &mut m.shape {
+            Shape::Pen(st) => {
+                let prev = *st.last().unwrap_or(&p);
+                st.push(p);
+                (prev, p)
+            }
+            Shape::Rect(a, b) => {
+                let old = *b;
+                *b = p;
+                // Eski ve yeni kare: köşe `a` sabit, ikisinin birleşimi.
+                let (a, o) = (*a, old);
+                let r = union(norm(a, o), norm(a, p));
+                (POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom })
+            }
+        };
+        self.redraw(self.mark_area(area.0, area.1));
+    }
+
+    /// Son çizimi geri alır.
     fn undo(&mut self) {
-        if self.strokes.pop().is_some()
+        if self.marks.pop().is_some()
             && let Some(s) = self.sel
         {
-            let area = footprint(s);
-            self.compose(area);
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), Some(&area), false);
-            }
+            self.redraw(footprint(s));
         }
     }
 
     fn set_sel(&mut self, sel: Option<RECT>) {
         let old = self.sel.map(footprint);
+        let old_bar = self.bar();
         self.sel = sel;
         let new = self.sel.map(footprint);
-        let area = match (old, new) {
-            (Some(a), Some(b)) => union(a, b),
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => return,
-        };
-        self.compose(area);
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), Some(&area), false);
+        let new_bar = self.bar();
+        let area = [old, new, old_bar.map(|b| b.0), new_bar.map(|b| b.0)].into_iter().flatten().reduce(union);
+        if let Some(area) = area {
+            self.redraw(area);
         }
     }
 
     /// `p` yerleşmiş seçimin kenar şeridinde mi (küçük seçimde içi de şerit sayılır).
     fn on_edge(&self, p: POINT) -> bool {
         let Some(r) = self.sel.filter(|_| self.placed) else { return false };
-        let g = self.grip;
-        let inside = |r: RECT| p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
-        let outer = RECT { left: r.left - g, top: r.top - g, right: r.right + g, bottom: r.bottom + g };
-        let inner = RECT { left: r.left + g, top: r.top + g, right: r.right - g, bottom: r.bottom - g };
+        let g = self.px(GRIP);
+        let inner = grow(r, -g);
         let small = inner.right - inner.left < 2 * g || inner.bottom - inner.top < 2 * g;
-        inside(outer) && (small || !inside(inner))
+        inside(grow(r, g), p) && (small || !inside(inner, p))
+    }
+
+    /// `p`'den tutmak seçimi taşır mı: kenar şeridi, araç seçili değilse içi de.
+    fn grabs(&self, p: POINT) -> bool {
+        self.on_edge(p) || (self.tool == Tool::Move && self.placed && self.sel.is_some_and(|r| inside(r, p)))
     }
 
     /// Seçimi `(dx, dy)` kaydırır; ekranın dışına taşmaz.
@@ -266,6 +378,121 @@ impl Shot {
         let dx = dx.clamp(-from.left, self.w - from.right);
         let dy = dy.clamp(-from.top, self.h - from.bottom);
         self.set_sel(Some(RECT { left: from.left + dx, top: from.top + dy, right: from.right + dx, bottom: from.bottom + dy }));
+    }
+
+    // --- Araç çubuğu ---
+
+    /// Çubuk ve düğmeleri (yerleşmiş seçim varsa): seçimin altında ortalı; sığmazsa üstünde,
+    /// o da sığmazsa içinde, altta.
+    fn bar(&self) -> Option<(RECT, Vec<(Bar, RECT)>)> {
+        let s = self.sel.filter(|_| self.placed)?;
+        let (btn, gap, pad, sep, off) = (self.px(BTN), self.px(GAP), self.px(PAD), self.px(SEP), self.px(OFF));
+        let w = 2 * pad + 8 * btn + 6 * gap + sep;
+        let h = 2 * pad + btn;
+        let mid = POINT { x: (s.left + s.right) / 2, y: (s.top + s.bottom) / 2 };
+        let mon = monitor_at(mid, self.hwnd);
+        let x = (mid.x - w / 2).clamp(mon.left + off, (mon.right - w - off).max(mon.left + off));
+        let y = if s.bottom + off + h <= mon.bottom - off {
+            s.bottom + off
+        } else if s.top - off - h >= mon.top + off {
+            s.top - off - h
+        } else {
+            s.bottom - off - h
+        };
+        let mut items = Vec::new();
+        let mut l = x + pad;
+        for (i, item) in [Bar::Tool(Tool::Pen), Bar::Tool(Tool::Rect)].into_iter().chain((0..COLORS.len()).map(Bar::Color)).enumerate() {
+            if i == 2 {
+                l += sep - gap;
+            }
+            items.push((item, RECT { left: l, top: y + pad, right: l + btn, bottom: y + pad + btn }));
+            l += btn + gap;
+        }
+        Some((RECT { left: x, top: y, right: x + w, bottom: y + h }, items))
+    }
+
+    fn bar_at(&self, p: POINT) -> Option<Bar> {
+        let (_, items) = self.bar()?;
+        items.into_iter().find(|(_, r)| inside(*r, p)).map(|(b, _)| b)
+    }
+
+    fn on_bar(&self, p: POINT) -> bool {
+        self.bar().is_some_and(|(r, _)| inside(r, p))
+    }
+
+    fn paint_bar(&self, dc: HDC) {
+        let Some((bar, items)) = self.bar() else { return };
+        let radius = self.px(10);
+        let round = |r: RECT, fill: u32, line: Option<u32>, rad: i32| unsafe {
+            let brush = CreateSolidBrush(colorref(fill));
+            let pen = match line {
+                Some(c) => CreatePen(PS_SOLID, self.px(1).max(1), colorref(c)),
+                None => CreatePen(PS_NULL, 0, COLORREF(0)),
+            };
+            let (ob, op) = (SelectObject(dc, brush.into()), SelectObject(dc, pen.into()));
+            let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            let _ = DeleteObject(brush.into());
+            let _ = DeleteObject(pen.into());
+        };
+        round(bar, 0x202020, Some(0x3a3a3a), radius);
+        for (item, r) in items {
+            let hover = self.hover == Some(item);
+            match item {
+                Bar::Tool(t) => {
+                    if self.tool == t {
+                        round(r, 0x454545, None, self.px(6));
+                    } else if hover {
+                        round(r, 0x2e2e2e, None, self.px(6));
+                    }
+                    // Segoe MDL2: kalem, boş kare.
+                    let glyph = if t == Tool::Pen { "\u{E70F}" } else { "\u{E739}" };
+                    let mut text: Vec<u16> = glyph.encode_utf16().collect();
+                    let mut r = r;
+                    unsafe {
+                        let old = SelectObject(dc, self.icons.into());
+                        SetBkMode(dc, TRANSPARENT);
+                        SetTextColor(dc, colorref(0xededed));
+                        DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        SelectObject(dc, old);
+                    }
+                }
+                Bar::Color(i) => {
+                    if hover && self.color != i {
+                        round(r, 0x2e2e2e, None, self.px(6));
+                    }
+                    // Seçili renk beyaz halkayla.
+                    if self.color == i {
+                        round(grow(r, -self.px(4)), 0x202020, Some(0xededed), self.px(6));
+                    }
+                    round(grow(r, -self.px(8)), COLORS[i], Some(0x5a5a5a), self.px(4));
+                }
+            }
+        }
+    }
+
+    /// Çubuğu yeniden çizdirir (seçim, araç, renk, üstünde durulan düğme değişince).
+    fn redraw_bar(&self) {
+        if let Some((r, _)) = self.bar() {
+            self.redraw(r);
+        }
+    }
+
+    fn click_bar(&mut self, item: Bar) {
+        match item {
+            // Seçili araca yeniden basmak bırakır: içinden tutmak yine taşır.
+            Bar::Tool(t) => self.tool = if self.tool == t { Tool::Move } else { t },
+            Bar::Color(i) => {
+                self.color = i;
+                COLOR.set(i);
+                // Renk seçmek çizmek içindir: araç yoksa kalem.
+                if self.tool == Tool::Move {
+                    self.tool = Tool::Pen;
+                }
+            }
+        }
+        self.redraw_bar();
     }
 
     /// Seçilen alanın pikselleri: 32 bit BGRA, yukarıdan aşağı.
@@ -277,7 +504,7 @@ impl Shot {
             let bmp = CreateCompatibleBitmap(self.src.0, w, h);
             SelectObject(dc, bmp.into());
             let _ = BitBlt(dc, 0, 0, w, h, Some(self.src.0), r.left, r.top, SRCCOPY);
-            self.draw_strokes(dc, r.left, r.top);
+            self.draw_marks(dc, r.left, r.top);
             let mut bi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -436,7 +663,10 @@ fn finish(deliver: Option<RECT>, save: bool) {
             let _ = DeleteDC(dc);
             let _ = DeleteObject(bmp.into());
         }
-        let _ = DeleteObject(shot.pen.into());
+        for pen in shot.pens {
+            let _ = DeleteObject(pen.into());
+        }
+        let _ = DeleteObject(shot.icons.into());
     }
 }
 
@@ -463,38 +693,55 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        // Kenar şeridinde dört yönlü ok: seçim oradan tutulup taşınır.
+        // Tutulunca seçimi taşıyan yerde dört yönlü ok, araç çubuğunda normal ok.
         WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
             let mut p = POINT::default();
             unsafe {
                 let _ = GetCursorPos(&mut p);
                 let _ = ScreenToClient(hwnd, &mut p);
             }
-            let grab = SHOT.with_borrow(|s| s.as_ref().is_some_and(|s| s.moving.is_some() || (!s.drawing && s.anchor.is_none() && s.on_edge(p))));
+            let cursor = SHOT.with_borrow(|s| match s {
+                Some(s) if s.on_bar(p) => IDC_ARROW,
+                Some(s) if s.moving.is_some() || (!s.drawing && s.anchor.is_none() && s.grabs(p)) => IDC_SIZEALL,
+                _ => IDC_CROSS,
+            });
             unsafe {
-                SetCursor(LoadCursorW(None, if grab { IDC_SIZEALL } else { IDC_CROSS }).ok());
+                SetCursor(LoadCursorW(None, cursor).ok());
             }
             LRESULT(1)
         }
         WM_LBUTTONDOWN => {
-            unsafe { SetCapture(hwnd) };
             let p = point(lp);
             SHOT.with_borrow_mut(|s| {
                 let Some(s) = s else { return };
-                match s.sel {
-                    // Kenarından tutulur: seçim taşınır.
-                    Some(r) if s.on_edge(p) => s.moving = Some((p, r)),
-                    // Yerleşmiş seçimin içinde: çizgi başlar.
-                    Some(r) if s.placed && p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom => {
-                        s.strokes.push(vec![p]);
-                        s.drawing = true;
-                        s.add_point(p);
+                // Araç çubuğu: düğmeye basılır, sürükleme yok.
+                if s.on_bar(p) {
+                    if let Some(item) = s.bar_at(p) {
+                        s.click_bar(item);
                     }
-                    // Dışında: yeni seçim (çizgiler gider).
+                    return;
+                }
+                unsafe { SetCapture(hwnd) };
+                match s.sel {
+                    // Kenarından (araç yoksa içinden) tutulur: seçim taşınır.
+                    Some(r) if s.grabs(p) => s.moving = Some((p, r)),
+                    // Yerleşmiş seçimin içinde: şekil başlar.
+                    Some(r) if s.placed && inside(r, p) => {
+                        let shape = if s.tool == Tool::Rect { Shape::Rect(p, p) } else { Shape::Pen(vec![p]) };
+                        s.marks.push(Mark { shape, color: s.color });
+                        s.drawing = true;
+                        s.extend(p);
+                    }
+                    // Dışında: yeni seçim (çizimler gider).
                     _ => {
-                        s.strokes.clear();
+                        let bar = s.bar();
+                        s.marks.clear();
                         s.placed = false;
+                        s.hover = None;
                         s.anchor = Some(p);
+                        if let Some((r, _)) = bar {
+                            s.redraw(r);
+                        }
                     }
                 }
             });
@@ -507,12 +754,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some((from, r)) = s.moving {
                     s.move_sel(r, p.x - from.x, p.y - from.y);
                 } else if s.drawing {
-                    // Çizgi seçimin dışına taşmaz.
+                    // Çizim seçimin dışına taşmaz.
                     if let Some(r) = s.sel {
-                        s.add_point(POINT { x: p.x.clamp(r.left, r.right - 1), y: p.y.clamp(r.top, r.bottom - 1) });
+                        s.extend(POINT { x: p.x.clamp(r.left, r.right - 1), y: p.y.clamp(r.top, r.bottom - 1) });
                     }
                 } else if let Some(a) = s.anchor {
                     s.set_sel(Some(norm(a, p)));
+                } else {
+                    let hover = s.bar_at(p);
+                    if hover != s.hover {
+                        s.hover = hover;
+                        s.redraw_bar();
+                    }
                 }
             });
             LRESULT(0)

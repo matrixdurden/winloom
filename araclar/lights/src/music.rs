@@ -12,8 +12,10 @@
 //! (otokorelasyon, 60–200 BPM, 120 civarı tercih); faz, vuruşların en çok üst üste geldiği yer.
 //! Sonraki vuruş tahmin edilir; komut ışığa varana dek geçen süre kadar önden gönderilir.
 //!
-//! İki mod: Ritim (tempo ızgarasının her vuruşunda yeni renk) ve Davul (kick, trampet ve zil
-//! ayrı renk; ızgaraya oturmayan zayıf vuruşlar, 808 basın nota değişimleri gibi, elenir).
+//! İki mod: Ritim (tempo ızgarasının her vuruşunda parlama) ve Davul (bas ve trampet darbelerinde
+//! parlama; ziller ve ızgaraya oturmayan zayıf vuruşlar, 808 basın nota değişimleri gibi,
+//! elenir). Renk seyrek değişir: iki vuruşta bir, paletin iki rengi arasında; palet 16 vuruşta
+//! bir kayar. Her vuruşta renk değişmesi göz yoruyor, şarkıyı izlemeyi zorlaştırıyordu.
 //! Bluetooth kulaklıkta ses geç geldiği için bütün komutlar istenen kadar geciktirilebilir.
 //!
 //! Ses yokken loopback paket göndermez; ölçer söner. Varsayılan cihaz değişirse yenisine geçilir.
@@ -205,6 +207,8 @@ pub struct Detector {
     /// Vuruş aralığı (kare) ve sonraki vuruşun ses saati.
     period: Option<f32>,
     next_beat: Option<f64>,
+    /// `next_beat`'in sıra numarası.
+    beat_no: u64,
     re: Vec<f32>,
     im: Vec<f32>,
 }
@@ -227,6 +231,7 @@ impl Detector {
             frames: 0,
             period: None,
             next_beat: None,
+            beat_no: 0,
             re: vec![0.0; N],
             im: vec![0.0; N],
         }
@@ -250,15 +255,28 @@ impl Detector {
     pub fn advance_beat(&mut self) {
         if let (Some(b), Some(p)) = (self.next_beat.as_mut(), self.period) {
             *b += (p / self.fr) as f64;
+            self.beat_no += 1;
         }
     }
 
     /// `at` vuruş ızgarasının 16'lık bir yerine yakın mı (tempo yoksa her yer yakın).
     pub fn on_grid(&self, at: f64) -> bool {
-        let (Some(b), Some(p)) = (self.next_beat, self.period) else { return true };
-        let step = (p / self.fr / 4.0) as f64;
+        self.near(at, 4.0, 0.045).unwrap_or(true)
+    }
+
+    /// `at` ızgaranın bir vuruşundaysa o vuruşun sıra numarası.
+    pub fn on_beat(&self, at: f64) -> Option<u64> {
+        let (b, p) = (self.next_beat?, (self.period? / self.fr) as f64);
+        let k = ((at - b) / p).round();
+        ((at - b - k * p).abs() < 0.06).then(|| (self.beat_no as i64 + k as i64).max(0) as u64)
+    }
+
+    /// `at`, vuruşun `div`'de birlik bölümlerinden birine `tol` saniye yakın mı.
+    fn near(&self, at: f64, div: f32, tol: f64) -> Option<bool> {
+        let (b, p) = (self.next_beat?, self.period?);
+        let step = (p / self.fr / div) as f64;
         let off = (at - b).rem_euclid(step);
-        off.min(step - off) < 0.045
+        Some(off.min(step - off) < tol)
     }
 
     /// Yeni pencere (`x`, `N` örnek; son örneği `now` anında). Bir kare önce vuruş varsa onu
@@ -409,47 +427,55 @@ impl Detector {
 
 #[derive(Clone, Copy, Debug)]
 enum Event {
+    /// Ritim ızgarasının vuruşu (tahmin edilen).
     Beat,
-    Hit(Kind),
+    /// Davul vuruşu; ızgaranın bir vuruşundaysa o vuruşun sıra numarası.
+    Hit(Kind, Option<u64>),
 }
 
-/// Vuruşlara tepki: komutları zamanında gönderir.
+/// Renk en çok iki vuruşta bir, palet 16 vuruşta bir değişir.
+const EVERY: u64 = 2;
+const PHRASE: u32 = 16;
+
+/// Vuruşlara tepki: komutları zamanında gönderir. Göz yorulmasın diye renk seyrek değişir:
+/// iki vuruşta bir, paletin iki rengi arasında (Davul'da yalnızca o vuruşa bir darbe düştüyse);
+/// öbür vuruşlar yalnızca parlatır, ziller ışığa yansımaz.
 struct Show {
     tx: Tx,
     cfg: Config,
-    /// Paletin tonu: kick iki komşu tonu sırayla, trampet karşı tonu kullanır.
+    /// Paletin tonu: iki rengi bu ton ve karşısı.
     hue: f32,
-    kick_alt: bool,
+    other: bool,
+    color: Option<[u8; 3]>,
     beats: u32,
     /// Bekleyen işler (gecikme ve önden gönderme için), zamana göre sıralı.
     queue: VecDeque<(Instant, Event)>,
-    /// Flaştan (ya da zil kırpışmasından) dönüş anı.
+    /// Parlamadan dönüş anı.
     dim_at: Option<Instant>,
 }
 
 impl Show {
     fn new(tx: Tx, cfg: Config) -> Self {
-        let mut s = Show { tx, cfg, hue: 0.0, kick_alt: false, beats: 0, queue: VecDeque::new(), dim_at: None };
+        let mut s = Show { tx, cfg, hue: 0.0, other: false, color: None, beats: 0, queue: VecDeque::new(), dim_at: None };
         s.enter();
         s
     }
 
-    fn low(&self) -> f32 {
-        (self.cfg.brightness * 0.12).max(0.02)
-    }
-
+    /// Vuruşlar arası parlaklık: Renk'te biraz kısık (vuruşta tama çıkar), Flaş'ta loş.
     fn rest(&self) -> f32 {
+        let b = self.cfg.brightness;
         match self.cfg.react {
-            React::Colors => self.cfg.brightness,
-            React::Flash => self.low(),
+            React::Colors => b * 0.7,
+            React::Flash => (b * 0.12).max(0.02),
         }
     }
 
     /// Tepki türüne girerken ışığın başlangıç hali.
     fn enter(&mut self) {
         self.dim_at = None;
+        self.color = None;
         self.tx.send(Cmd::Brightness(self.rest()));
-        self.tx.send(Cmd::Color(hsv(self.hue, 1.0)));
+        self.set_color(hsv(self.hue, 1.0));
     }
 
     fn config(&mut self, cfg: Config) {
@@ -479,54 +505,57 @@ impl Show {
         }
     }
 
-    fn flash(&mut self, level: f32, ms: u64, now: Instant) {
+    /// Renk aynıysa gönderilmez.
+    fn set_color(&mut self, c: [u8; 3]) {
+        if self.color != Some(c) {
+            self.color = Some(c);
+            self.tx.send(Cmd::Color(c));
+        }
+    }
+
+    fn pulse(&mut self, level: f32, ms: u64, now: Instant) {
         self.tx.send(Cmd::Brightness(self.cfg.brightness * level));
         self.dim_at = Some(now + Duration::from_millis(ms));
     }
 
     fn play(&mut self, e: Event, now: Instant) {
-        let flash = self.cfg.react == React::Flash;
         match e {
-            // Ritim: her vuruşta altın açıyla ilerleyen ton; art arda renkler hep belirgin farklı.
             Event::Beat => {
-                self.hue = (self.hue + 137.5) % 360.0;
-                self.tx.send(Cmd::Color(hsv(self.hue, 1.0)));
-                if flash {
-                    self.flash(1.0, 140, now);
+                if (self.beats as u64).is_multiple_of(EVERY) {
+                    self.swap();
+                }
+                self.pulse(1.0, 130, now);
+            }
+            Event::Hit(kind @ (Kind::Kick | Kind::Snare), beat) => {
+                if beat.is_some_and(|b| b.is_multiple_of(EVERY)) {
+                    self.swap();
+                }
+                let on_beat = beat.is_some();
+                let (level, ms) = match (kind, on_beat) {
+                    (Kind::Kick, true) => (1.0, 140),
+                    (_, true) => (0.9, 110),
+                    _ => (0.8, 80),
+                };
+                // Ara vuruş, sürmekte olan güçlü bir parlamayı kesmez.
+                if on_beat || self.dim_at.is_none() {
+                    self.pulse(level, ms, now);
                 }
             }
-            Event::Hit(Kind::Kick) => {
-                self.kick_alt = !self.kick_alt;
-                let h = self.hue + if self.kick_alt { 0.0 } else { 35.0 };
-                self.tx.send(Cmd::Color(hsv(h, 1.0)));
-                if flash {
-                    self.flash(1.0, 140, now);
-                }
-            }
-            Event::Hit(Kind::Snare) => {
-                self.tx.send(Cmd::Color(hsv(self.hue + 180.0, 1.0)));
-                if flash {
-                    self.flash(0.85, 110, now);
-                }
-            }
-            // Zil rengi değiştirmez: kısa bir kırpışma (başka bir flaşın üstüne binmez).
-            Event::Hit(Kind::Hat) => {
-                if self.dim_at.is_none() {
-                    if flash {
-                        self.flash(0.4, 50, now);
-                    } else {
-                        self.flash(0.45, 60, now);
-                    }
-                }
-            }
+            Event::Hit(Kind::Hat, _) => {}
         }
     }
 
-    /// Davul modunda palet iki ölçüde (8 vuruş) bir ilerler.
+    /// Paletin öbür rengine geçer.
+    fn swap(&mut self) {
+        self.other = !self.other;
+        self.set_color(hsv(self.hue + if self.other { 180.0 } else { 0.0 }, 1.0));
+    }
+
+    /// Palet 16 vuruşta bir ilerler (altın açıyla değil, komşu tonlara: geçiş yumuşak).
     fn beat_passed(&mut self) {
         self.beats += 1;
-        if self.cfg.source == Source::Drums && self.beats.is_multiple_of(8) {
-            self.hue = (self.hue + 70.0) % 360.0;
+        if self.beats.is_multiple_of(PHRASE) {
+            self.hue = (self.hue + 60.0) % 360.0;
         }
     }
 }
@@ -634,8 +663,8 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
                 if let Some(hit) = det.frame(&buf[..N], t, c.sensitivity * 2.0) {
                     meter.lock().unwrap().hits[hit.kind as usize] = Some(wall(hit.at));
                     // Davul: ızgaraya oturmayan zayıf vuruşlar elenir.
-                    if c.source == Source::Drums && (hit.strength >= c.sensitivity * 4.0 || det.on_grid(hit.at)) {
-                        show.schedule(wall(hit.at), Event::Hit(hit.kind));
+                    if c.source == Source::Drums && hit.kind != Kind::Hat && (hit.strength >= c.sensitivity * 4.0 || det.on_grid(hit.at)) {
+                        show.schedule(wall(hit.at), Event::Hit(hit.kind, det.on_beat(hit.at)));
                     }
                 }
                 buf.drain(..HOP);

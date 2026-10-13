@@ -575,12 +575,12 @@ impl Lights {
     fn music_items(&self) -> Vec<Item> {
         let s = &self.settings;
         let react_sub = match s.react {
-            React::Colors => t!("Every beat brings the next color", "Her vuruşta sıradaki renk"),
-            React::Flash => t!("Waits dim, flashes on every beat", "Loş bekler, her vuruşta parlar"),
+            React::Colors => t!("Two colors swap every other beat", "İki renk, iki vuruşta bir yer değiştirir"),
+            React::Flash => t!("Waits dim, flashes on the beats", "Loş bekler, vuruşta parlar"),
         };
         let source_sub = match s.source {
-            Source::Beat => t!("Locks onto the song's tempo, like CapCut's beat marks", "Şarkının temposuna kilitlenir, CapCut'ın ritim işaretleri gibi"),
-            Source::Drums => t!("Kick, snare and hi-hat each their own color", "Bas, trampet ve zil ayrı renk"),
+            Source::Beat => t!("Locks onto the tempo like CapCut and pulses on every beat", "CapCut gibi tempoya kilitlenir, her vuruşta parlar"),
+            Source::Drums => t!("Pulses on kick and snare hits; hi-hats are left out", "Bas ve trampet darbelerinde parlar, ziller sayılmaz"),
         };
         let mut v = vec![
             Item::Section(t!("Music", "Müzik").into()),

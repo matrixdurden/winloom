@@ -82,7 +82,13 @@ impl Music {
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                 }
-                let mut beat = Beat::new(tx, c.lock().unwrap().react, c.lock().unwrap().brightness);
+                // Kilit tek seferde alınıp bırakılır: aynı satırda iki kez almak iş parçacığını
+                // kendi kendine kilitler (sayfa da ayara dokununca onu bekleyip donar).
+                let (react, brightness) = {
+                    let c = c.lock().unwrap();
+                    (c.react, c.brightness)
+                };
+                let mut beat = Beat::new(tx, react, brightness);
                 while !s.load(Ordering::Relaxed) {
                     if let Err(e) = unsafe { capture(&c, &m, &s, &mut beat) } {
                         ortak::log!("lights: ses yakalanamadı · {}", e.message());
@@ -449,6 +455,22 @@ mod tests {
         assert_eq!(hsv(120.0, 1.0), [0, 255, 0]);
         assert_eq!(hsv(240.0, 1.0), [0, 0, 255]);
         assert_eq!(hsv(60.0, 0.0), [255, 255, 255]);
+    }
+
+    /// Müzik açıkken ayar değiştirmek ve kapatmak beklemeden döner (eskiden iş parçacığı kendi
+    /// kilidinde takılıyor, sayfa da onu bekleyip donuyordu).
+    #[test]
+    fn ayar_takilmaz() {
+        let cfg = Config { react: React::Flash, source: Source::All, sensitivity: 1.5, brightness: 0.5 };
+        let m = Music::start(Tx::test(), cfg);
+        std::thread::sleep(Duration::from_millis(300));
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            m.set(Config { react: React::Colors, ..cfg });
+            drop(m);
+            let _ = done.send(());
+        });
+        assert!(wait.recv_timeout(Duration::from_secs(5)).is_ok(), "müzik iş parçacığı takıldı");
     }
 
     /// 120 BPM'lik yapay bas vuruşu: her vuruş bulunur, BPM ~120 çıkar.

@@ -82,6 +82,8 @@ struct Settings {
     react: React,
     source: Source,
     sensitivity: f32,
+    /// Işık gecikmesi (ms): Bluetooth kulaklıkta ses geç gelir.
+    delay: u32,
 }
 
 impl Settings {
@@ -99,8 +101,9 @@ impl Settings {
             reverse: false,
             music: false,
             react: React::Colors,
-            source: Source::Bass,
+            source: Source::Drums,
             sensitivity: 1.5,
+            delay: 0,
         };
         let text = std::fs::read_to_string(ini()).unwrap_or_default();
         for line in text.lines() {
@@ -119,7 +122,8 @@ impl Settings {
                 "ters" => s.reverse = v == "1",
                 "muzik" => s.music = v == "1",
                 "tepki" => s.react = if v == "flas" { React::Flash } else { React::Colors },
-                "kaynak" => s.source = if v == "hepsi" { Source::All } else { Source::Bass },
+                "kaynak" => s.source = if v == "ritim" { Source::Beat } else { Source::Drums },
+                "gecikme" => s.delay = v.parse().map_or(0, |d: u32| d.min(DELAY_MAX)),
                 "hassasiyet" => s.sensitivity = v.parse().map_or(s.sensitivity, |b: f32| b.clamp(SENS_MIN, SENS_MAX)),
                 _ => {}
             }
@@ -131,7 +135,7 @@ impl Settings {
         std::fs::create_dir_all(dir())?;
         let [r, g, b] = self.color;
         let text = format!(
-            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ntepki={}\nkaynak={}\nhassasiyet={}\n",
+            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ntepki={}\nkaynak={}\nhassasiyet={}\ngecikme={}\n",
             self.address,
             self.name,
             self.model,
@@ -143,14 +147,21 @@ impl Settings {
             self.reverse as u8,
             self.music as u8,
             if self.react == React::Flash { "flas" } else { "renk" },
-            if self.source == Source::All { "hepsi" } else { "bas" },
+            if self.source == Source::Beat { "ritim" } else { "davul" },
             self.sensitivity,
+            self.delay,
         );
         std::fs::write(ini(), text)
     }
 
     fn music_config(&self) -> music::Config {
-        music::Config { react: self.react, source: self.source, sensitivity: self.sensitivity, brightness: self.brightness.max(0.05) }
+        music::Config {
+            react: self.react,
+            source: self.source,
+            sensitivity: self.sensitivity,
+            brightness: self.brightness.max(0.05),
+            delay: Duration::from_millis(self.delay as u64),
+        }
     }
 }
 
@@ -239,6 +250,10 @@ const R_REACT: u32 = 10;
 const R_SOURCE: u32 = 11;
 const R_SENS: u32 = 12;
 const C_METER: u32 = 13;
+const R_DELAY: u32 = 14;
+
+/// Işık gecikmesinin üst sınırı (ms).
+const DELAY_MAX: u32 = 400;
 /// Efekt satırları: bu + efektin kimliği.
 const R_EFFECT: u32 = 1000;
 
@@ -564,8 +579,8 @@ impl Lights {
             React::Flash => t!("Waits dim, flashes on every beat", "Loş bekler, her vuruşta parlar"),
         };
         let source_sub = match s.source {
-            Source::Bass => t!("Only the kick drum", "Yalnızca bas davul"),
-            Source::All => t!("Kick, snare or hi-hat", "Bas, trampet ya da zil"),
+            Source::Beat => t!("Locks onto the song's tempo, like CapCut's beat marks", "Şarkının temposuna kilitlenir, CapCut'ın ritim işaretleri gibi"),
+            Source::Drums => t!("Kick, snare and hi-hat each their own color", "Bas, trampet ve zil ayrı renk"),
         };
         let mut v = vec![
             Item::Section(t!("Music", "Müzik").into()),
@@ -585,13 +600,19 @@ impl Lights {
                 R_SOURCE,
                 t!("Beats", "Vuruşlar"),
                 source_sub,
-                Ctl::Seg(vec![t!("Bass", "Bas").into(), t!("All", "Hepsi").into()], (s.source == Source::All) as usize),
+                Ctl::Seg(vec![t!("Rhythm", "Ritim").into(), t!("Drums", "Davul").into()], (s.source == Source::Drums) as usize),
             )),
             Item::Row(Row::new(
                 R_SENS,
                 t!("Sensitivity", "Hassasiyet"),
                 t!("Higher catches quieter beats", "Arttıkça daha hafif vuruşlar da yakalanır"),
                 Ctl::Slider(sens_to_v(s.sensitivity), pct(sens_to_v(s.sensitivity))),
+            )),
+            Item::Row(Row::new(
+                R_DELAY,
+                t!("Light delay", "Işık gecikmesi"),
+                t!("With Bluetooth headphones the sound comes late: raise it if the light runs ahead", "Bluetooth kulaklıkta ses geç gelir: ışık önden gidiyorsa artır"),
+                Ctl::Slider(s.delay as f32 / DELAY_MAX as f32, format!("{} ms", s.delay)),
             )),
         ];
         if s.music {
@@ -686,6 +707,12 @@ impl Lights {
                 self.update_music();
                 self.redraw();
             }
+            R_DELAY => {
+                // 10 ms adımlarla.
+                self.settings.delay = ((v.clamp(0.0, 1.0) * DELAY_MAX as f32 / 10.0).round() * 10.0) as u32;
+                self.update_music();
+                self.redraw();
+            }
             _ => {}
         }
     }
@@ -731,7 +758,7 @@ impl Lights {
                 self.redraw();
             }
             Hit::Form(F::Seg(R_SOURCE, k)) => {
-                self.settings.source = if k == 1 { Source::All } else { Source::Bass };
+                self.settings.source = if k == 0 { Source::Beat } else { Source::Drums };
                 self.update_music();
                 self.save();
                 self.redraw();
@@ -797,37 +824,35 @@ impl Lights {
         }
     }
 
-    /// Canlı ölçer: solda vuruşta yanan nokta, ortada basın eşiğe göre seviyesi, sağda BPM.
+    /// Canlı ölçer: ritim, bas, trampet ve zil için vuruşta yanan dört nokta; sağda BPM.
     fn paint_meter(&self, g: &Gfx, r: Rect) {
         Self::card(g, r);
         let Some(m) = self.music.as_ref().map(Music::meter) else { return };
-        let age = m.last_beat.map(|t| t.elapsed()).unwrap_or(Duration::from_secs(9));
-        let glow = (1.0 - age.as_secs_f32() / 0.25).clamp(0.0, 1.0);
-        let (cx, cy) = (r.l + 44.0, r.cy());
-        g.circle(cx, cy, 22.0, pal().hover);
-        if glow > 0.0 {
-            let c = match self.settings.react {
-                React::Colors => Color::rgb(0xFACC15),
-                React::Flash => pal().text,
-            };
-            g.circle(cx, cy, 10.0 + 12.0 * glow, c.alpha(glow));
+        let glow = |t: Option<std::time::Instant>| {
+            let age = t.map(|t| t.elapsed()).unwrap_or(Duration::from_secs(9));
+            (1.0 - age.as_secs_f32() / 0.25).clamp(0.0, 1.0)
+        };
+        let dots = [
+            (t!("Beat", "Ritim"), m.beat, pal().text),
+            (t!("Kick", "Bas"), m.hits[0], Color::rgb(0xFF4D4D)),
+            (t!("Snare", "Trampet"), m.hits[1], Color::rgb(0x4DA3FF)),
+            (t!("Hi-hat", "Zil"), m.hits[2], Color::rgb(0x5BE07A)),
+        ];
+        let span = ((r.w() - 140.0) / dots.len() as f32).min(96.0);
+        for (i, (label, at, c)) in dots.into_iter().enumerate() {
+            let cx = r.l + 28.0 + span / 2.0 + i as f32 * span;
+            let cy = r.t + 42.0;
+            g.circle(cx, cy, 18.0, pal().hover);
+            let v = glow(at);
+            if v > 0.0 {
+                g.circle(cx, cy, 8.0 + 10.0 * v, c.alpha(v));
+            }
+            g.text(label, &g.f.small, Rect::new(cx - span / 2.0, cy + 26.0, cx + span / 2.0, cy + 46.0), pal().muted);
         }
-        let (l, rr) = (r.l + 88.0, r.r - 120.0);
-        let label = if m.sound { t!("Bass", "Bas") } else { t!("No sound", "Ses yok") };
-        g.text(label, &g.f.small, Rect::new(l, r.t + 18.0, rr, r.t + 38.0), pal().muted);
-        let bar = Rect::new(l, r.cy() - 4.0, rr, r.cy() + 6.0);
-        g.fill(bar, 5.0, pal().hover);
-        // Eşik çubuğun ortasında: üstüne çıkan her şey vuruş adayı.
-        let v = (m.bass / 2.0).clamp(0.0, 1.0);
-        if v > 0.0 {
-            g.fill(Rect::new(bar.l, bar.t, bar.l + bar.w() * v, bar.b), 5.0, if m.bass >= 1.0 { pal().text } else { pal().faint });
-        }
-        let mid = bar.l + bar.w() / 2.0;
-        g.fill(Rect::new(mid - 1.0, bar.t - 6.0, mid + 1.0, bar.b + 6.0), 0.0, pal().muted);
-        g.text(t!("threshold", "eşik"), &g.f.small, Rect::new(mid - 30.0, bar.b + 8.0, mid + 60.0, bar.b + 28.0), pal().faint);
         let bpm = if m.bpm > 0.0 && m.sound { format!("{:.0}", m.bpm) } else { "–".into() };
         g.text(&bpm, &g.f.heading, Rect::new(r.r - 104.0, r.t + 22.0, r.r - 16.0, r.cy() + 8.0), pal().text);
-        g.text("BPM", &g.f.small, Rect::new(r.r - 104.0, r.cy() + 8.0, r.r - 16.0, r.b - 18.0), pal().muted);
+        let sub = if m.sound { "BPM" } else { t!("No sound", "Ses yok") };
+        g.text(sub, &g.f.small, Rect::new(r.r - 104.0, r.cy() + 8.0, r.r - 16.0, r.b - 18.0), pal().muted);
     }
 }
 
@@ -941,6 +966,9 @@ impl ToolPage for Lights {
             Hit::Form(form::Hit::Slider(R_SPEED, _)) => self.set_speed((self.settings.speed + step).clamp(0.0, 1.0)),
             Hit::Form(form::Hit::Slider(R_SENS, _)) => {
                 self.slide(R_SENS, (sens_to_v(self.settings.sensitivity) + step).clamp(0.0, 1.0));
+            }
+            Hit::Form(form::Hit::Slider(R_DELAY, _)) => {
+                self.slide(R_DELAY, (self.settings.delay as f32 / DELAY_MAX as f32 + step).clamp(0.0, 1.0));
             }
             _ => {
                 let k = self.tab as usize;

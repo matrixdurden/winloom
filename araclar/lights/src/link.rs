@@ -310,7 +310,7 @@ struct Conn {
     session: Option<GattSession>,
     service: GattDeviceService,
     ch: GattCharacteristic,
-    /// Cevaplı yazma (destekliyorsa; olmazsa cevapsız).
+    /// Cevaplı yazma (yalnızca cevapsız desteklenmiyorsa).
     with_response: bool,
     without_ok: bool,
     status_token: i64,
@@ -385,7 +385,9 @@ impl Conn {
             session,
             service,
             ch,
-            with_response: with || !without,
+            // Cevapsız yazma tercih edilir: cevaplı her komut ~180 ms sürüyor, müzikte ışık
+            // sesin gerisinde kalıyordu (cevapsız ~1 ms).
+            with_response: with && !without,
             without_ok: without,
             status_token: st.unwrap_or(0),
             notify,
@@ -528,6 +530,25 @@ pub fn cli_test() -> i32 {
                             }
                         }
                         std::thread::sleep(Duration::from_millis(1200));
+                    }
+                    // Bir komutun ışığa varma süresi (müzikte gecikme bunun kadar).
+                    let modes: &[bool] = if c.without_ok { &[true, false] } else { &[true] };
+                    for &with in modes {
+                        c.with_response = with;
+                        let mut ms = Vec::new();
+                        for i in 0..20u32 {
+                            let Some(p) = (m.encode)(Cmd::Color(crate::music::hsv(i as f32 * 137.5, 1.0))) else { break };
+                            let t = Instant::now();
+                            if c.write(&p).is_ok() {
+                                ms.push(t.elapsed().as_secs_f32() * 1000.0);
+                            }
+                            std::thread::sleep(Duration::from_millis(60));
+                        }
+                        ms.sort_by(f32::total_cmp);
+                        if let (Some(lo), Some(hi)) = (ms.first(), ms.last()) {
+                            let what = if with { "cevaplı" } else { "cevapsız" };
+                            println!("  {what} yazma: orta {:.0} ms (en az {lo:.0}, en çok {hi:.0}), {} / 20", ms[ms.len() / 2], ms.len());
+                        }
                     }
                     (failed > 0) as i32
                 }

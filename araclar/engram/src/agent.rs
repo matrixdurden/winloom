@@ -284,6 +284,11 @@ fn tools() -> Vec<Tool> {
             schema: json!({"type":"object","properties":{"action":{"type":"string","enum":["status","lock","sleep","display_off"]}},"required":["action"],"additionalProperties":false}),
         },
         Tool {
+            name: "light",
+            description: "Odadaki Bluetooth LED ışık (winloom'ın Işıklar aracı; \"led\", \"oda ışığı\"): status (durum), on, off, color (color: #RRGGBB ya da kırmızı, turuncu, sarı, yeşil, turkuaz, mavi, mor, pembe, sıcak beyaz, beyaz; müzikle yanma açıksa kapanır), brightness (value: 1-100), music_on / music_off (müziğin vuruşuyla yanma). Kullanılmayan alanlara boş yaz, value'ya 0.",
+            schema: json!({"type":"object","properties":{"action":{"type":"string","enum":["status","on","off","color","brightness","music_on","music_off"]},"color":{"type":"string"},"value":{"type":"integer"}},"required":["action","color","value"],"additionalProperties":false}),
+        },
+        Tool {
             name: "list_windows",
             description: "Açık pencerelerin listesi: başlık ve uygulama.",
             schema: json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
@@ -604,6 +609,17 @@ impl Agent {
                         _ => crate::system::find_files(&s("query"), &s("kind"), input["days"].as_u64().unwrap_or(0) as u32, input["limit"].as_u64().unwrap_or(20) as usize)?,
                     }
                 }
+                "light" => {
+                    let action = s("action");
+                    let body = match action.as_str() {
+                        "color" => format!("color {}", s("color")),
+                        "brightness" => format!("brightness {}", input["value"].as_i64().unwrap_or(100)),
+                        a => a.to_string(),
+                    };
+                    on(Out::Tool(format!("{}: {body}", t!("Light", "Işık"))));
+                    ortak::hub::ask("lights", &body, std::time::Duration::from_secs(4))
+                        .map_err(|e| if e.ends_with("açık değil") { "Işıklar aracına ulaşılamadı: winloom'da kurulu ve açık olmalı".to_string() } else { e })?
+                }
                 "clipboard" => {
                     on(Out::Tool(format!("{}: {}", t!("Clipboard", "Pano"), s("action"))));
                     if s("action") == "set" { crate::system::clipboard_set(&s("text"))? } else { crate::system::clipboard_get()? }
@@ -666,24 +682,8 @@ impl Agent {
         self.history.retain(|m| !m["content"].as_array().is_some_and(|a| a.is_empty()));
     }
 
-    /// Eski ekran görüntüleri geçmişte kalmasın: her istekte yeniden gönderilir ve pahalıdır.
-    /// Yalnızca en sonuncusu durur, öncekilerin yerine kısa bir not.
     fn drop_old_images(&mut self) {
-        let mut seen = false;
-        for m in self.history.iter_mut().rev() {
-            let Some(blocks) = m["content"].as_array_mut() else { continue };
-            for b in blocks.iter_mut().rev() {
-                let Some(inner) = b["content"].as_array_mut() else { continue };
-                for c in inner.iter_mut().rev() {
-                    if c["type"] == "image" {
-                        if seen {
-                            *c = json!({"type": "text", "text": "[eski ekran görüntüsü]"});
-                        }
-                        seen = true;
-                    }
-                }
-            }
-        }
+        drop_old_images(&mut self.history);
     }
 
     /// Kullanıcı yazısını geçmişe ekler; son mesaj zaten kullanıcınınsa (yarıda kalan tur, araç
@@ -844,7 +844,7 @@ fn describe_action(name: &str, input: &Value) -> String {
 }
 
 /// `engram --chat-test "..."`: pencere açmadan bir tur; metin ve araç çağrıları konsola.
-pub fn probe(cfg: &Config, text: &str) -> i32 {
+pub fn probe(cfg: &Config, texts: &[String]) -> i32 {
     use std::io::Write;
     let mut agent = Agent::new(cfg.clone());
     println!("notlar: {} ({})", agent.vault.notes.len(), cfg.vault.display());
@@ -871,7 +871,14 @@ pub fn probe(cfg: &Config, text: &str) -> i32 {
         let _ = std::io::stdin().read_line(&mut line);
         matches!(line.trim(), "e" | "evet" | "y" | "yes")
     };
-    let r = agent.turn(text, Mode::Text, &mut Hooks { on: &mut on, confirm: &mut confirm, stop: &stop });
+    let mut r = Ok(());
+    for text in texts {
+        println!("\n> {text}");
+        r = agent.turn(text, Mode::Text, &mut Hooks { on: &mut on, confirm: &mut confirm, stop: &stop });
+        if r.is_err() {
+            break;
+        }
+    }
     match r {
         Ok(()) => {
             let u = &agent.usage;
@@ -895,5 +902,58 @@ fn strip_time(text: &str) -> &str {
             return t;
         }
         t = t[5..].trim_start().trim_start_matches(['-', '–']).trim_start();
+    }
+}
+
+/// Eski ekran görüntüleri geçmişte kalmasın: her istekte yeniden gönderilir ve pahalıdır.
+/// Yalnızca en sonuncusu durur, öncekilerin yerine kısa bir not. Bloklara `get_mut` ile bakılır:
+/// `b["content"]` gibi değiştirilebilir indeksleme anahtar yoksa `"content": null` ekliyordu, API
+/// metin bloğundaki bu fazla alanı reddediyordu (ikinci mesajdan itibaren HTTP 400).
+fn drop_old_images(history: &mut [Value]) {
+    let mut seen = false;
+    for m in history.iter_mut().rev() {
+        let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        for b in blocks.iter_mut().rev() {
+            let Some(inner) = b.get_mut("content").and_then(Value::as_array_mut) else { continue };
+            for c in inner.iter_mut().rev() {
+                if c["type"] == "image" {
+                    if seen {
+                        *c = json!({"type": "text", "text": "[eski ekran görüntüsü]"});
+                    }
+                    seen = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shot(id: &str) -> Value {
+        json!({"type": "tool_result", "tool_use_id": id, "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}}]})
+    }
+
+    #[test]
+    fn eski_goruntuler_bloklara_alan_eklemez() {
+        let mut h = vec![
+            json!({"role": "user", "content": "[yazi] selam"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Selam."}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "[yazi] odayı kırmızı yap"}]}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "computer", "input": {}}]}),
+            json!({"role": "user", "content": [shot("a")]}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "computer", "input": {}}]}),
+            json!({"role": "user", "content": [shot("b")]}),
+        ];
+        let before = h.clone();
+        drop_old_images(&mut h);
+        // Metin ve araç çağrısı blokları aynen kalır (eskiden "content": null ekleniyordu).
+        for i in [0, 1, 2, 3, 5] {
+            assert_eq!(h[i], before[i], "mesaj {i} değişti: {}", h[i]);
+        }
+        // Yalnızca son ekran görüntüsü durur.
+        assert_eq!(h[4]["content"][0]["content"][0], json!({"type": "text", "text": "[eski ekran görüntüsü]"}));
+        assert_eq!(h[6], before[6]);
     }
 }

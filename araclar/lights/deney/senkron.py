@@ -188,5 +188,5 @@ if cam:
 
     lag_to_camera(light, f"{what} komutu")
     lag_to_camera(kicks, "bas vuruşu (ses)")
-np.savez(os.path.join(ortak.OUT, "senkron.npz"), kicks=kicks, snares=snares, ups=ups, light=light, cam=np.array(cam) if cam else np.zeros((0, 4)))
+np.savez(os.path.join(ortak.OUT, "senkron.npz"), ft=ft, bass=bass, mid=mid, kicks=kicks, snares=snares, ups=ups, light=light, cam=np.array(cam) if cam else np.zeros((0, 4)))
 print(f"\nkayıt: {os.path.join(ortak.OUT, 'senkron.npz')}")

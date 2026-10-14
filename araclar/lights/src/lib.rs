@@ -35,6 +35,8 @@ use surucu::{Cmd, Model};
 
 /// Müzik sekmesindeki ölçer tazelenir.
 pub const TIMER_METER: usize = 901;
+/// Başka bir araçtan (asistan) istek geldi: `hub::serve("lights")`.
+const WM_ASK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 91;
 const METER_MS: u32 = 33;
 
 /// Hazır renkler: (renk, İngilizce, Türkçe).
@@ -86,8 +88,9 @@ struct Settings {
     sensitivity: f32,
     /// Işığın zamanlaması (ms): artı geciktirir (Bluetooth kulaklıkta ses geç gelir), eksi önden.
     delay: i32,
-    /// Müzikteki iki renk: `PAIRS` sırası.
-    pair: usize,
+    /// Müzikte bas ve trampet vuruşunun rengi.
+    bass: [u8; 3],
+    snare: [u8; 3],
 }
 
 impl Settings {
@@ -109,7 +112,8 @@ impl Settings {
             source: Source::Drums,
             sensitivity: 1.5,
             delay: 0,
-            pair: 0,
+            bass: rgb(PRESETS[0].0),
+            snare: rgb(PRESETS[5].0),
         };
         let text = std::fs::read_to_string(ini()).unwrap_or_default();
         for line in text.lines() {
@@ -131,7 +135,14 @@ impl Settings {
                 "tepki" => s.react = if v == "flas" { React::Flash } else { React::Colors },
                 "kaynak" => s.source = if v == "ritim" { Source::Beat } else { Source::Drums },
                 "gecikme" => s.delay = v.parse().map_or(0, |d: i32| d.clamp(-DELAY_EARLY, DELAY_MAX)),
-                "cift" => s.pair = v.parse().map_or(0, |p: usize| p.min(PAIRS.len() - 1)),
+                // Eski sürümün hazır ikilileri (kırmızı · mavi, mor · turkuaz, pembe · sarı, yeşil · mor).
+                "cift" => {
+                    if let Some(&[a, b]) = v.parse::<usize>().ok().and_then(|i| [[0, 5], [6, 4], [7, 2], [3, 6]].get(i)) {
+                        (s.bass, s.snare) = (rgb(PRESETS[a].0), rgb(PRESETS[b].0));
+                    }
+                }
+                "bas_renk" => s.bass = u32::from_str_radix(v, 16).map_or(s.bass, rgb),
+                "trampet_renk" => s.snare = u32::from_str_radix(v, 16).map_or(s.snare, rgb),
                 "hassasiyet" => s.sensitivity = v.parse().map_or(s.sensitivity, |b: f32| b.clamp(SENS_MIN, SENS_MAX)),
                 _ => {}
             }
@@ -143,7 +154,7 @@ impl Settings {
         std::fs::create_dir_all(dir())?;
         let [r, g, b] = self.color;
         let text = format!(
-            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ndinle={}\ntepki={}\nkaynak={}\nhassasiyet={}\ngecikme={}\ncift={}\n",
+            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ndinle={}\ntepki={}\nkaynak={}\nhassasiyet={}\ngecikme={}\nbas_renk={:06X}\ntrampet_renk={:06X}\n",
             self.address,
             self.name,
             self.model,
@@ -159,7 +170,8 @@ impl Settings {
             if self.source == Source::Beat { "ritim" } else { "davul" },
             self.sensitivity,
             self.delay,
-            self.pair,
+            hex(self.bass),
+            hex(self.snare),
         );
         std::fs::write(ini(), text)
     }
@@ -172,7 +184,7 @@ impl Settings {
             sensitivity: self.sensitivity,
             brightness: self.brightness.max(0.05),
             delay: self.delay,
-            colors: PAIRS[self.pair].map(|i| rgb(PRESETS[i].0)),
+            colors: [self.bass, self.snare],
         }
     }
 }
@@ -272,16 +284,14 @@ const R_SOURCE: u32 = 11;
 const R_SENS: u32 = 12;
 const C_METER: u32 = 13;
 const R_DELAY: u32 = 14;
-const R_PAIR: u32 = 15;
+/// Müzikte bas ve trampet rengi seçicileri.
+const C_BASS: u32 = 15;
+const C_SNARE: u32 = 17;
 const R_LISTEN: u32 = 16;
 
 /// Işık zamanlamasının sınırları (ms): bu kadar önden, bu kadar geriden.
 const DELAY_EARLY: i32 = 300;
 const DELAY_MAX: i32 = 400;
-
-/// Müzikteki renk ikilileri (`PRESETS` sırası): kırmızı · mavi, mor · turkuaz, pembe · sarı,
-/// yeşil · mor.
-const PAIRS: [[usize; 2]; 4] = [[0, 5], [6, 4], [7, 2], [3, 6]];
 
 fn delay_to_v(d: i32) -> f32 {
     (d + DELAY_EARLY) as f32 / (DELAY_EARLY + DELAY_MAX) as f32
@@ -299,6 +309,9 @@ const COLORS_H: f32 = 112.0;
 const SWATCH: f32 = 30.0;
 const SEARCH_H: f32 = 36.0;
 const METER_H: f32 = 108.0;
+/// Müzikteki renk seçicisi: solda adı, sağda hazır renkler.
+const PICK_H: f32 = 62.0;
+const PICK_LABEL: f32 = 110.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
@@ -306,6 +319,8 @@ enum Hit {
     Tab(Tab),
     Form(form::Hit),
     Swatch(usize),
+    /// Müzikteki renk seçicisi (`C_BASS` / `C_SNARE`) ve hazır rengin sırası.
+    Pick(u32, usize),
     /// Ton şeridi: 0..1.
     Hue(f32),
     Search,
@@ -337,6 +352,8 @@ pub struct Lights {
     pressed: Hit,
     /// Sürüklenen kaydırıcının satırı (ton şeridi: `C_COLORS`).
     drag: Option<u32>,
+    /// Başka araçlardan gelen istekler (`answer`).
+    asks: std::sync::mpsc::Receiver<ortak::hub::Request>,
     visible: bool,
     w: f32,
     h: f32,
@@ -357,6 +374,7 @@ impl Lights {
             hover: Hit::None,
             pressed: Hit::None,
             drag: None,
+            asks: ortak::hub::serve("lights", hwnd, WM_ASK),
             visible: false,
             w: 0.0,
             h: 0.0,
@@ -484,6 +502,58 @@ impl Lights {
         self.save();
         self.update_timer();
         self.redraw();
+    }
+
+    // --- Başka araçlardan istek (asistan) ---
+
+    /// `hub::ask("lights", ...)`: "status", "on", "off", "color <#RRGGBB ya da hazır rengin adı>",
+    /// "brightness <0-100>", "music_on", "music_off". Renk istenince müzikle yanma kapanır (yoksa
+    /// müzik rengi hemen değiştirir). Cevap ışığın son hali.
+    fn answer(&mut self, body: &str) -> Result<String, String> {
+        let body = body.trim();
+        let (cmd, arg) = body.split_once(' ').unwrap_or((body, ""));
+        let arg = arg.trim();
+        match cmd {
+            "status" => {}
+            "on" => self.set_power(true),
+            "off" => {
+                self.set_music(false);
+                self.set_power(false);
+            }
+            "color" => {
+                let c = parse_color(arg).ok_or_else(|| format!("renk anlaşılmadı: {arg}"))?;
+                self.set_music(false);
+                self.set_color(c);
+                self.save();
+            }
+            "brightness" => {
+                let v: f32 = arg.trim_end_matches('%').trim().parse().map_err(|_| format!("parlaklık anlaşılmadı: {arg}"))?;
+                if !self.settings.power {
+                    self.set_power(true);
+                }
+                self.set_brightness((v / 100.0).clamp(0.01, 1.0));
+                self.save();
+            }
+            "music_on" => self.set_music(true),
+            "music_off" => self.set_music(false),
+            _ => return Err(format!("bilinmeyen istek: {cmd}")),
+        }
+        let st = self.link.status();
+        if st.state == State::Off && self.settings.address != 0 {
+            self.connect();
+        }
+        let s = &self.settings;
+        let link = match st.state {
+            State::Connected => format!("{} bağlı", st.name),
+            State::Off if s.address == 0 => "hiç ışık bağlanmadı (Işıklar sayfasından bağlanmalı)".to_string(),
+            _ => "ışık şu an bağlı değil, bağlanıyor; komut bağlanınca gider".to_string(),
+        };
+        let color = PRESETS
+            .iter()
+            .find(|p| p.0 == hex(s.color))
+            .map_or_else(|| format!("#{:06X}", hex(s.color)), |p| format!("{} (#{:06X})", p.2, p.0));
+        let onoff = |b: bool| if b { "açık" } else { "kapalı" };
+        Ok(format!("{link} · {} · renk {color} · parlaklık {} · müzikle yanma {}", onoff(s.power), pct(s.brightness), onoff(s.music)))
     }
 
     fn update_music(&self) {
@@ -645,18 +715,6 @@ impl Lights {
                 Ctl::Seg(vec![t!("Color", "Renk").into(), t!("Flash", "Flaş").into()], (s.react == React::Flash) as usize),
             )),
             Item::Row(Row::new(
-                R_PAIR,
-                t!("Colors", "Renkler"),
-                match s.react {
-                    React::Colors => t!("The two colors that swap on the beats", "Vuruşlarda yer değiştiren iki renk"),
-                    React::Flash => t!("Flash uses the first one", "Flaş ilkinde yanar"),
-                },
-                Ctl::Seg(
-                    PAIRS.iter().map(|[a, b]| t!(format!("{} · {}", PRESETS[*a].1, PRESETS[*b].1), format!("{} · {}", PRESETS[*a].2, PRESETS[*b].2))).collect(),
-                    s.pair,
-                ),
-            )),
-            Item::Row(Row::new(
                 R_SOURCE,
                 t!("Beats", "Vuruşlar"),
                 source_sub,
@@ -675,6 +733,12 @@ impl Lights {
                 Ctl::Slider(delay_to_v(s.delay), if s.delay == 0 { "0 ms".into() } else { format!("{:+} ms", s.delay) }),
             )),
         ];
+        // Renk'te bas ve trampet ayrı renk, Flaş'ta tek renk.
+        v.push(Item::Section(t!("Colors", "Renkler").into()));
+        v.push(Item::Custom(C_BASS, PICK_H));
+        if s.react == React::Colors {
+            v.push(Item::Custom(C_SNARE, PICK_H));
+        }
         if s.music {
             if !self.link.connected() {
                 v.push(Item::Note(t!("No light connected: the beats only show here", "Işık bağlı değil: vuruşlar yalnızca burada görünür").into(), false));
@@ -716,6 +780,18 @@ impl Lights {
         (swatches, hue)
     }
 
+    /// Müzikteki renk seçicisinin hazır renklerinin yerleri.
+    fn pick_rects(r: Rect) -> Vec<Rect> {
+        let inner = Rect::new(r.l + 16.0 + PICK_LABEL, r.t + 16.0, r.r - 16.0, r.b - 16.0);
+        let gap = ((inner.w() - SWATCH * PRESETS.len() as f32) / (PRESETS.len() - 1) as f32).clamp(6.0, 18.0);
+        (0..PRESETS.len())
+            .map(|i| {
+                let x = inner.l + i as f32 * (SWATCH + gap);
+                Rect::new(x, inner.t, x + SWATCH, inner.t + SWATCH)
+            })
+            .collect()
+    }
+
     fn hit(&self, g: &Gfx, x: f32, y: f32) -> Hit {
         if y < HEADER {
             return Hit::None;
@@ -735,6 +811,10 @@ impl Lights {
                     return Hit::Hue(((x - hue.l) / hue.w()).clamp(0.0, 1.0));
                 }
                 Hit::None
+            }
+            form::Hit::Custom(id @ (C_BASS | C_SNARE)) => {
+                let Some(r) = f.custom(id) else { return Hit::None };
+                Self::pick_rects(r).iter().position(|s| s.contains(x, y)).map_or(Hit::None, |i| Hit::Pick(id, i))
             }
             form::Hit::Custom(C_SEARCH) => Hit::Search,
             form::Hit::Custom(_) => Hit::None,
@@ -822,8 +902,13 @@ impl Lights {
                 self.save();
                 self.redraw();
             }
-            Hit::Form(F::Seg(R_PAIR, k)) => {
-                self.settings.pair = k.min(PAIRS.len() - 1);
+            Hit::Pick(id, i) => {
+                let c = rgb(PRESETS[i].0);
+                if id == C_BASS {
+                    self.settings.bass = c;
+                } else {
+                    self.settings.snare = c;
+                }
                 self.update_music();
                 self.save();
                 self.redraw();
@@ -858,6 +943,13 @@ impl Lights {
             }
             if let Some(r) = f.custom(C_METER) {
                 self.paint_meter(g, r);
+            }
+            let flash = self.settings.react == React::Flash;
+            if let Some(r) = f.custom(C_BASS) {
+                self.paint_pick(g, r, C_BASS, if flash { t!("Color", "Renk") } else { t!("Kick", "Bas") }, self.settings.bass);
+            }
+            if let Some(r) = f.custom(C_SNARE) {
+                self.paint_pick(g, r, C_SNARE, t!("Snare", "Trampet"), self.settings.snare);
             }
         });
         let hover = Tab::ALL.iter().position(|&t| self.hover == Hit::Tab(t));
@@ -895,6 +987,23 @@ impl Lights {
         }
     }
 
+    /// Müzikteki renk seçicisi: solda adı, sağda hazır renkler (seçilinin çevresinde halka).
+    fn paint_pick(&self, g: &Gfx, r: Rect, id: u32, label: &str, current: [u8; 3]) {
+        Self::card(g, r);
+        g.text(label, &g.f.body, Rect::new(r.l + 16.0, r.t, r.l + 16.0 + PICK_LABEL, r.b), pal().text);
+        let current = hex(current);
+        for (i, s) in Self::pick_rects(r).iter().enumerate() {
+            let (cx, cy) = (s.l + SWATCH / 2.0, s.cy());
+            let c = PRESETS[i].0;
+            if c == current {
+                g.ring(cx, cy, SWATCH / 2.0 + 3.0, pal().text, 2.0);
+            } else if self.hover == Hit::Pick(id, i) {
+                g.ring(cx, cy, SWATCH / 2.0 + 3.0, pal().faint, 1.5);
+            }
+            g.circle(cx, cy, SWATCH / 2.0 - 1.0, Color::rgb(c));
+        }
+    }
+
     /// Canlı ölçer: ritim, bas, trampet ve zil için vuruşta yanan dört nokta; sağda BPM.
     fn paint_meter(&self, g: &Gfx, r: Rect) {
         Self::card(g, r);
@@ -925,6 +1034,20 @@ impl Lights {
         let sub = if m.sound { "BPM" } else { t!("No sound", "Ses yok") };
         g.text(sub, &g.f.small, Rect::new(r.r - 104.0, r.cy() + 8.0, r.r - 16.0, r.b - 18.0), pal().muted);
     }
+}
+
+/// "#20E040", "20e040" ya da hazır rengin adı (Türkçe ya da İngilizce; büyük küçük harf ve ı/i fark
+/// etmez).
+fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() == 6
+        && let Ok(v) = u32::from_str_radix(h, 16)
+    {
+        return Some(rgb(v));
+    }
+    let fold = |t: &str| t.trim().to_lowercase().replace('ı', "i").replace('\u{307}', "");
+    let f = fold(s);
+    PRESETS.iter().find(|p| fold(p.1) == f || fold(p.2) == f).map(|p| rgb(p.0))
 }
 
 /// Tam doygun ve tam parlak bir renkse tonu.
@@ -964,6 +1087,13 @@ impl ToolPage for Lights {
     fn message(&mut self, _g: &mut Gfx, msg: u32, wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_LINK => self.on_link(),
+            WM_ASK => {
+                let asks: Vec<_> = self.asks.try_iter().collect();
+                for r in asks {
+                    let a = self.answer(&r.body);
+                    r.reply(a);
+                }
+            }
             WM_TIMER if wp.0 == TIMER_METER => self.redraw(),
             _ => return None,
         }
@@ -1113,10 +1243,27 @@ impl ToolPage for Lights {
 
 impl Drop for Lights {
     fn drop(&mut self) {
+        ortak::hub::close("lights");
         // Önce müzik (bağlantıya komut gönderen), sonra bağlantı.
         self.music = None;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_METER);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renk_adlari() {
+        assert_eq!(parse_color("#20E040"), Some([0x20, 0xE0, 0x40]));
+        assert_eq!(parse_color("ff0000"), Some([255, 0, 0]));
+        assert_eq!(parse_color("Yeşil"), Some(rgb(0x20E040)));
+        assert_eq!(parse_color("KIRMIZI"), Some(rgb(0xFF2020)));
+        assert_eq!(parse_color("sicak beyaz"), Some(rgb(0xFFB070)));
+        assert_eq!(parse_color("blue"), Some(rgb(0x1060FF)));
+        assert_eq!(parse_color("lacivert"), None);
     }
 }

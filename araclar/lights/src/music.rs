@@ -15,8 +15,9 @@
 //! Vuruşların kaynağı: Ritim (tempo ızgarası; vuruş tahmin edildiği için ışık sesle aynı anda
 //! değişir) ya da Davul (bas ve trampet darbeleri; ziller ve ızgaraya oturmayan zayıf vuruşlar,
 //! 808 basın nota değişimleri gibi, elenir; darbe duyulduktan sonra bulunduğu için ışık biraz
-//! geriden gelir). Tepki sade: Renk'te her vuruşta iki renk yer değiştirir, Flaş'ta ışık yanıp
-//! söner; palet 16 vuruşta bir kayar. Ölçümler (`deney/`, kamera ve sesle): renkle parlaklığı
+//! geriden gelir). Tepki sade: Renk'te bas vuruşu bas renginde, trampet trampet renginde yanar
+//! (Ritim'de hangi vuruşların bas olduğu duyulan darbelerden öğrenilir, ışık yine önden gider),
+//! Flaş'ta ışık yanıp söner. Ölçümler (`deney/`, kamera ve sesle): renkle parlaklığı
 //! birlikte oynatmak ışıkta bulanık bir dalgaya dönüşüyor, %70–%100 parlaklık oynaması gözle
 //! seçilmiyordu; şarkıyla uyumlu hissettirmiyordu.
 //! Bluetooth kulaklıkta ses geç geldiği için bütün komutlar istenen kadar geciktirilebilir.
@@ -108,7 +109,7 @@ pub struct Config {
     /// Işığın zamanlaması (ms): artı geciktirir (Bluetooth kulaklıkta ses geç gelir), eksi önden
     /// gönderir (yalnızca Ritim'de: Davul darbeyi duyduktan sonra bulur).
     pub delay: i32,
-    /// Renk'te yer değiştiren iki renk; Flaş ilkinde yanar.
+    /// Bas ve trampet rengi: Renk'te bas vuruşu ilkinde, trampet ikincisinde yanar; Flaş ilkinde.
     pub colors: [[u8; 3]; 2],
 }
 
@@ -228,6 +229,8 @@ pub struct Detector {
     /// Vuruş aralığı (kare) ve sonraki vuruşun ses saati.
     period: Option<f32>,
     next_beat: Option<f64>,
+    /// `next_beat`'in sıra numarası (bas vuruşunun tek mi çift mi olduğu öğrenilir).
+    beat_no: u64,
     re: Vec<f32>,
     im: Vec<f32>,
 }
@@ -250,6 +253,7 @@ impl Detector {
             frames: 0,
             period: None,
             next_beat: None,
+            beat_no: 0,
             re: vec![0.0; N],
             im: vec![0.0; N],
         }
@@ -273,7 +277,20 @@ impl Detector {
     pub fn advance_beat(&mut self) {
         if let (Some(b), Some(p)) = (self.next_beat.as_mut(), self.period) {
             *b += (p / self.fr) as f64;
+            self.beat_no += 1;
         }
+    }
+
+    /// Sıradaki ritim vuruşunun sıra numarası.
+    pub fn beat_no(&self) -> u64 {
+        self.beat_no
+    }
+
+    /// `at` ızgaranın bir vuruşundaysa o vuruşun sıra numarası.
+    pub fn on_beat(&self, at: f64) -> Option<u64> {
+        let (b, p) = (self.next_beat?, (self.period? / self.fr) as f64);
+        let k = ((at - b) / p).round();
+        ((at - b - k * p).abs() < 0.06).then(|| (self.beat_no as i64 + k as i64).max(0) as u64)
     }
 
     /// `at` vuruş ızgarasının 16'lık bir yerine yakın mı (tempo yoksa her yer yakın).
@@ -437,8 +454,8 @@ impl Detector {
 
 #[derive(Clone, Copy, Debug)]
 enum Event {
-    /// Ritim ızgarasının vuruşu (tahmin edilen).
-    Beat,
+    /// Ritim ızgarasının vuruşu (tahmin edilen) ve sıra numarası.
+    Beat(u64),
     /// Davul vuruşu.
     Hit(Kind),
 }
@@ -466,6 +483,11 @@ struct Show {
     queue: VecDeque<(Instant, Event)>,
     /// Parlamadan dönüş anı.
     dim_at: Option<Instant>,
+    /// Bas vuruşunun tek (1) mi çift (0) sıralı vuruşlarda olduğuna dair birikmiş kanıt: duyulan
+    /// kick'ler kendi vuruşunu, trampetler öbürünü destekler.
+    bass_on: [f32; 2],
+    /// Varılan karar (0: çift, 1: tek): öbür taraf açıkça öne geçene dek tutulur.
+    bass_parity: Option<u64>,
 }
 
 impl Show {
@@ -479,6 +501,8 @@ impl Show {
             last: None,
             queue: VecDeque::new(),
             dim_at: None,
+            bass_on: [0.0; 2],
+            bass_parity: None,
         };
         s.enter();
         s
@@ -533,6 +557,26 @@ impl Show {
         }
     }
 
+    /// Duyulan darbe ızgaranın `beat` numaralı vuruşundaysa: kick o vuruşun, trampet öbürünün bas
+    /// olduğunu destekler. Eski kanıt yavaşça söner (tempo yeniden oturunca sıra kayabilir).
+    fn learn(&mut self, kind: Kind, beat: u64) {
+        let p = match kind {
+            Kind::Kick => beat % 2,
+            Kind::Snare => (beat + 1) % 2,
+            Kind::Hat => return,
+        } as usize;
+        for v in &mut self.bass_on {
+            *v *= 0.92;
+        }
+        self.bass_on[p] += 1.0;
+        let [a, b] = self.bass_on;
+        let lead = (b > a) as u64;
+        if (a - b).abs() >= 1.5 && self.bass_parity != Some(lead) {
+            self.bass_parity = Some(lead);
+            ortak::log!("lights: bas vuruşları {} sırada", if lead == 1 { "tek" } else { "çift" });
+        }
+    }
+
     /// Renk aynıysa gönderilmez.
     fn set_color(&mut self, c: [u8; 3]) {
         if self.color != Some(c) {
@@ -552,8 +596,17 @@ impl Show {
         self.last = Some(now);
         match self.cfg.react {
             React::Colors => {
-                self.other = !self.other;
-                self.set_color(self.cfg.colors[self.other as usize]);
+                // Bas mı trampet mi: Davul'da duyulan darbe, Ritim'de vuruşun sırası (öğrenilmediyse
+                // iki renk sırayla).
+                let snare = match e {
+                    Event::Hit(kind) => kind == Kind::Snare,
+                    Event::Beat(n) => match self.bass_parity {
+                        Some(p) => n % 2 != p,
+                        None => !self.other,
+                    },
+                };
+                self.other = snare;
+                self.set_color(self.cfg.colors[snare as usize]);
             }
             React::Flash => {
                 self.tx.send(Cmd::Brightness(self.cfg.brightness));
@@ -707,6 +760,9 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
                     if c.source == Source::Drums && hit.kind != Kind::Hat && (hit.strength >= c.sensitivity * 4.0 || det.on_grid(hit.at)) {
                         show.schedule(wall(hit.at), Event::Hit(hit.kind));
                     }
+                    if let Some(k) = det.on_beat(hit.at) {
+                        show.learn(hit.kind, k);
+                    }
                 }
                 buf.drain(..HOP);
                 done += HOP as u64;
@@ -719,7 +775,7 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
             {
                 if det.playing(end) {
                     if c.source == Source::Beat {
-                        show.schedule(wall(b).checked_sub(LEAD).unwrap_or(now), Event::Beat);
+                        show.schedule(wall(b).checked_sub(LEAD).unwrap_or(now), Event::Beat(det.beat_no()));
                     }
                     meter.lock().unwrap().beat = Some(wall(b));
                 }

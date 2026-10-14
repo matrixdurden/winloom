@@ -80,7 +80,7 @@ pub fn leftovers() -> Vec<String> {
     if d.exists() { vec![d.display().to_string()] } else { Vec::new() }
 }
 
-/// `--engram-chat-test "..."`, `--engram-vault-test`, `--engram-media-test`.
+/// `--engram-chat-test "..." ["..." …]` (her biri aynı konuşmada bir tur), `--engram-vault-test`, `--engram-media-test`.
 fn cli(args: &[String]) -> Option<i32> {
     let mut cfg = config::Config::load();
     // Ortam değişkeni ayar dosyasının önüne geçmez, boşluğunu doldurur (komut satırı denemeleri).
@@ -111,8 +111,12 @@ fn cli(args: &[String]) -> Option<i32> {
         }
         "--engram-chat-test" => {
             ortak::tool::console(false);
-            let text = args.get(1).cloned().unwrap_or_else(|| "Merhaba, neler biliyorsun?".into());
-            Some(agent::probe(&cfg, &text))
+            // Her argüman aynı konuşmada bir tur (geçmişle ilgili hatalar ancak ikinci turda çıkar).
+            let mut texts: Vec<String> = args[1..].to_vec();
+            if texts.is_empty() {
+                texts.push("Merhaba, neler biliyorsun?".into());
+            }
+            Some(agent::probe(&cfg, &texts))
         }
         _ => None,
     }

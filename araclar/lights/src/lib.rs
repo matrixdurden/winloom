@@ -10,6 +10,7 @@
 extern crate ortak;
 
 mod link;
+mod listen;
 mod music;
 pub mod surucu;
 mod tool;
@@ -29,7 +30,7 @@ use ortak::ui::*;
 use ortak::util;
 
 use link::{Link, State, WM_LINK};
-use music::{Music, React, Source};
+use music::{Listen, Music, React, Source};
 use surucu::{Cmd, Model};
 
 /// Müzik sekmesindeki ölçer tazelenir.
@@ -79,11 +80,14 @@ struct Settings {
     speed: f32,
     reverse: bool,
     music: bool,
+    listen: Listen,
     react: React,
     source: Source,
     sensitivity: f32,
-    /// Işık gecikmesi (ms): Bluetooth kulaklıkta ses geç gelir.
-    delay: u32,
+    /// Işığın zamanlaması (ms): artı geciktirir (Bluetooth kulaklıkta ses geç gelir), eksi önden.
+    delay: i32,
+    /// Müzikteki iki renk: `PAIRS` sırası.
+    pair: usize,
 }
 
 impl Settings {
@@ -100,10 +104,12 @@ impl Settings {
             speed: 0.5,
             reverse: false,
             music: false,
+            listen: Listen::All,
             react: React::Colors,
             source: Source::Drums,
             sensitivity: 1.5,
             delay: 0,
+            pair: 0,
         };
         let text = std::fs::read_to_string(ini()).unwrap_or_default();
         for line in text.lines() {
@@ -121,9 +127,11 @@ impl Settings {
                 "hiz" => s.speed = v.parse().map_or(s.speed, |b: f32| b.clamp(0.0, 1.0)),
                 "ters" => s.reverse = v == "1",
                 "muzik" => s.music = v == "1",
+                "dinle" => s.listen = if v == "muzik" { Listen::Music } else { Listen::All },
                 "tepki" => s.react = if v == "flas" { React::Flash } else { React::Colors },
                 "kaynak" => s.source = if v == "ritim" { Source::Beat } else { Source::Drums },
-                "gecikme" => s.delay = v.parse().map_or(0, |d: u32| d.min(DELAY_MAX)),
+                "gecikme" => s.delay = v.parse().map_or(0, |d: i32| d.clamp(-DELAY_EARLY, DELAY_MAX)),
+                "cift" => s.pair = v.parse().map_or(0, |p: usize| p.min(PAIRS.len() - 1)),
                 "hassasiyet" => s.sensitivity = v.parse().map_or(s.sensitivity, |b: f32| b.clamp(SENS_MIN, SENS_MAX)),
                 _ => {}
             }
@@ -135,7 +143,7 @@ impl Settings {
         std::fs::create_dir_all(dir())?;
         let [r, g, b] = self.color;
         let text = format!(
-            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ntepki={}\nkaynak={}\nhassasiyet={}\ngecikme={}\n",
+            "adres={:X}\nad={}\nmodel={}\noto={}\nacik={}\nrenk={r:02X}{g:02X}{b:02X}\nparlaklik={}\nefekt={}\nhiz={}\nters={}\nmuzik={}\ndinle={}\ntepki={}\nkaynak={}\nhassasiyet={}\ngecikme={}\ncift={}\n",
             self.address,
             self.name,
             self.model,
@@ -146,21 +154,25 @@ impl Settings {
             self.speed,
             self.reverse as u8,
             self.music as u8,
+            if self.listen == Listen::Music { "muzik" } else { "hepsi" },
             if self.react == React::Flash { "flas" } else { "renk" },
             if self.source == Source::Beat { "ritim" } else { "davul" },
             self.sensitivity,
             self.delay,
+            self.pair,
         );
         std::fs::write(ini(), text)
     }
 
     fn music_config(&self) -> music::Config {
         music::Config {
+            listen: self.listen,
             react: self.react,
             source: self.source,
             sensitivity: self.sensitivity,
             brightness: self.brightness.max(0.05),
-            delay: Duration::from_millis(self.delay as u64),
+            delay: self.delay,
+            colors: PAIRS[self.pair].map(|i| rgb(PRESETS[i].0)),
         }
     }
 }
@@ -196,6 +208,15 @@ fn cli(args: &[String]) -> Option<i32> {
         "--lights-test" | "--isiklar-dene" => {
             ortak::tool::console(false);
             Some(link::cli_test())
+        }
+        "--lights-script" | "--isiklar-betik" => {
+            ortak::tool::console(false);
+            let address = args.get(3).and_then(|a| u64::from_str_radix(a, 16).ok());
+            Some(link::cli_script(args.get(1)?, args.get(2)?, address))
+        }
+        "--lights-pace" | "--isiklar-tempo" => {
+            ortak::tool::console(false);
+            Some(link::cli_pace(args.iter().any(|a| a == "cevapli" || a == "--with-response")))
         }
         _ => None,
     }
@@ -251,9 +272,25 @@ const R_SOURCE: u32 = 11;
 const R_SENS: u32 = 12;
 const C_METER: u32 = 13;
 const R_DELAY: u32 = 14;
+const R_PAIR: u32 = 15;
+const R_LISTEN: u32 = 16;
 
-/// Işık gecikmesinin üst sınırı (ms).
-const DELAY_MAX: u32 = 400;
+/// Işık zamanlamasının sınırları (ms): bu kadar önden, bu kadar geriden.
+const DELAY_EARLY: i32 = 300;
+const DELAY_MAX: i32 = 400;
+
+/// Müzikteki renk ikilileri (`PRESETS` sırası): kırmızı · mavi, mor · turkuaz, pembe · sarı,
+/// yeşil · mor.
+const PAIRS: [[usize; 2]; 4] = [[0, 5], [6, 4], [7, 2], [3, 6]];
+
+fn delay_to_v(d: i32) -> f32 {
+    (d + DELAY_EARLY) as f32 / (DELAY_EARLY + DELAY_MAX) as f32
+}
+
+/// 10 ms adımlarla.
+fn v_to_delay(v: f32) -> i32 {
+    ((v.clamp(0.0, 1.0) * (DELAY_EARLY + DELAY_MAX) as f32 / 10.0).round() * 10.0) as i32 - DELAY_EARLY
+}
 /// Efekt satırları: bu + efektin kimliği.
 const R_EFFECT: u32 = 1000;
 
@@ -575,12 +612,17 @@ impl Lights {
     fn music_items(&self) -> Vec<Item> {
         let s = &self.settings;
         let react_sub = match s.react {
-            React::Colors => t!("Two colors swap every other beat", "İki renk, iki vuruşta bir yer değiştirir"),
-            React::Flash => t!("Waits dim, flashes on the beats", "Loş bekler, vuruşta parlar"),
+            React::Colors => t!("Two colors swap on every beat", "Her vuruşta iki renk yer değiştirir"),
+            React::Flash => t!("Flashes on every beat, dim in between", "Her vuruşta yanıp söner"),
         };
         let source_sub = match s.source {
-            Source::Beat => t!("Locks onto the tempo like CapCut and pulses on every beat", "CapCut gibi tempoya kilitlenir, her vuruşta parlar"),
-            Source::Drums => t!("Pulses on kick and snare hits; hi-hats are left out", "Bas ve trampet darbelerinde parlar, ziller sayılmaz"),
+            Source::Beat => t!("Locks onto the tempo: the light changes right on the beat", "Tempoya kilitlenir, ışık vuruşla aynı anda değişir"),
+            Source::Drums => t!("Follows kick and snare hits, a little behind; hi-hats are left out", "Bas ve trampet darbelerini izler, biraz geriden gelir; ziller sayılmaz"),
+        };
+        let listen_sub = match (s.listen, self.music.as_ref().and_then(|m| m.meter().app)) {
+            (Listen::All, _) => t!("Everything the computer plays, Discord and games too", "Bilgisayarda çalan her şey, Discord ve oyunlar da").to_string(),
+            (Listen::Music, Some(app)) => t!(format!("Only Spotify or a browser · now {app}"), format!("Yalnızca Spotify ya da tarayıcı · şu an {app}")),
+            (Listen::Music, None) => t!("Only Spotify or a browser · nothing playing", "Yalnızca Spotify ya da tarayıcı · çalan yok").to_string(),
         };
         let mut v = vec![
             Item::Section(t!("Music", "Müzik").into()),
@@ -591,10 +633,28 @@ impl Lights {
                 Ctl::Toggle(s.music),
             )),
             Item::Row(Row::new(
+                R_LISTEN,
+                t!("Listen to", "Dinlenen ses"),
+                listen_sub,
+                Ctl::Seg(vec![t!("All sound", "Tüm ses").into(), t!("Spotify · browser", "Spotify · tarayıcı").into()], (s.listen == Listen::Music) as usize),
+            )),
+            Item::Row(Row::new(
                 R_REACT,
                 t!("On a beat", "Vuruşta"),
                 react_sub,
                 Ctl::Seg(vec![t!("Color", "Renk").into(), t!("Flash", "Flaş").into()], (s.react == React::Flash) as usize),
+            )),
+            Item::Row(Row::new(
+                R_PAIR,
+                t!("Colors", "Renkler"),
+                match s.react {
+                    React::Colors => t!("The two colors that swap on the beats", "Vuruşlarda yer değiştiren iki renk"),
+                    React::Flash => t!("Flash uses the first one", "Flaş ilkinde yanar"),
+                },
+                Ctl::Seg(
+                    PAIRS.iter().map(|[a, b]| t!(format!("{} · {}", PRESETS[*a].1, PRESETS[*b].1), format!("{} · {}", PRESETS[*a].2, PRESETS[*b].2))).collect(),
+                    s.pair,
+                ),
             )),
             Item::Row(Row::new(
                 R_SOURCE,
@@ -610,9 +670,9 @@ impl Lights {
             )),
             Item::Row(Row::new(
                 R_DELAY,
-                t!("Light delay", "Işık gecikmesi"),
-                t!("With Bluetooth headphones the sound comes late: raise it if the light runs ahead", "Bluetooth kulaklıkta ses geç gelir: ışık önden gidiyorsa artır"),
-                Ctl::Slider(s.delay as f32 / DELAY_MAX as f32, format!("{} ms", s.delay)),
+                t!("Light timing", "Işık zamanlaması"),
+                t!("Light behind the music: slide left. Ahead (Bluetooth headphones): slide right", "Işık geriden geliyorsa sola, önden gidiyorsa (Bluetooth kulaklık) sağa çek"),
+                Ctl::Slider(delay_to_v(s.delay), if s.delay == 0 { "0 ms".into() } else { format!("{:+} ms", s.delay) }),
             )),
         ];
         if s.music {
@@ -708,8 +768,7 @@ impl Lights {
                 self.redraw();
             }
             R_DELAY => {
-                // 10 ms adımlarla.
-                self.settings.delay = ((v.clamp(0.0, 1.0) * DELAY_MAX as f32 / 10.0).round() * 10.0) as u32;
+                self.settings.delay = v_to_delay(v);
                 self.update_music();
                 self.redraw();
             }
@@ -753,6 +812,18 @@ impl Lights {
             Hit::Form(F::Toggle(R_MUSIC) | F::Row(R_MUSIC)) => self.set_music(!self.settings.music),
             Hit::Form(F::Seg(R_REACT, k)) => {
                 self.settings.react = if k == 1 { React::Flash } else { React::Colors };
+                self.update_music();
+                self.save();
+                self.redraw();
+            }
+            Hit::Form(F::Seg(R_LISTEN, k)) => {
+                self.settings.listen = if k == 1 { Listen::Music } else { Listen::All };
+                self.update_music();
+                self.save();
+                self.redraw();
+            }
+            Hit::Form(F::Seg(R_PAIR, k)) => {
+                self.settings.pair = k.min(PAIRS.len() - 1);
                 self.update_music();
                 self.save();
                 self.redraw();
@@ -968,7 +1039,7 @@ impl ToolPage for Lights {
                 self.slide(R_SENS, (sens_to_v(self.settings.sensitivity) + step).clamp(0.0, 1.0));
             }
             Hit::Form(form::Hit::Slider(R_DELAY, _)) => {
-                self.slide(R_DELAY, (self.settings.delay as f32 / DELAY_MAX as f32 + step).clamp(0.0, 1.0));
+                self.slide(R_DELAY, (delay_to_v(self.settings.delay) + step).clamp(0.0, 1.0));
             }
             _ => {
                 let k = self.tab as usize;

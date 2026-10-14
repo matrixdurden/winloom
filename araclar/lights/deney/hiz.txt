@@ -1,0 +1,56 @@
+power 1
+color 255 0 0
+wait 100
+bright 0.2
+wait 1500
+mark P1 parlaklik 0.2 -> 1.0
+bright 1.0
+wait 1200
+mark P2 parlaklik 1.0 -> 0.2
+bright 0.2
+wait 1200
+mark P3 parlaklik 0.2 -> 0.7
+bright 0.7
+wait 1200
+mark P4 parlaklik 0.7 -> 1.0
+bright 1.0
+wait 1200
+mark R1 renk kirmizi -> mavi
+color 0 0 255
+wait 1200
+mark R2 renk mavi -> kirmizi
+color 255 0 0
+wait 1200
+mark K1 renkle kisma 255 -> 50
+color 50 0 0
+wait 1200
+mark K2 renkle acma 50 -> 255
+color 255 0 0
+wait 1200
+mark K3 renkle kisma 255 -> 120
+color 120 0 0
+wait 1200
+mark K4 renkle acma 120 -> 255
+color 255 0 0
+wait 1200
+mark N0 hazirlik parlaklik 0.25
+bright 0.25
+wait 1200
+mark N1 parlaklik nabzi 130 ms (1.0 sonra 0.25)
+bright 1.0
+wait 130
+bright 0.25
+wait 1200
+mark N2 hazirlik renk 50
+bright 1.0
+wait 100
+color 50 0 0
+wait 1200
+mark N3 renk nabzi 130 ms (255 sonra 50)
+color 255 0 0
+wait 130
+color 50 0 0
+wait 1200
+mark bitti
+color 255 0 0
+wait 600

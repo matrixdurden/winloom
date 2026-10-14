@@ -12,10 +12,13 @@
 //! (otokorelasyon, 60–200 BPM, 120 civarı tercih); faz, vuruşların en çok üst üste geldiği yer.
 //! Sonraki vuruş tahmin edilir; komut ışığa varana dek geçen süre kadar önden gönderilir.
 //!
-//! İki mod: Ritim (tempo ızgarasının her vuruşunda parlama) ve Davul (bas ve trampet darbelerinde
-//! parlama; ziller ve ızgaraya oturmayan zayıf vuruşlar, 808 basın nota değişimleri gibi,
-//! elenir). Renk seyrek değişir: iki vuruşta bir, paletin iki rengi arasında; palet 16 vuruşta
-//! bir kayar. Her vuruşta renk değişmesi göz yoruyor, şarkıyı izlemeyi zorlaştırıyordu.
+//! Vuruşların kaynağı: Ritim (tempo ızgarası; vuruş tahmin edildiği için ışık sesle aynı anda
+//! değişir) ya da Davul (bas ve trampet darbeleri; ziller ve ızgaraya oturmayan zayıf vuruşlar,
+//! 808 basın nota değişimleri gibi, elenir; darbe duyulduktan sonra bulunduğu için ışık biraz
+//! geriden gelir). Tepki sade: Renk'te her vuruşta iki renk yer değiştirir, Flaş'ta ışık yanıp
+//! söner; palet 16 vuruşta bir kayar. Ölçümler (`deney/`, kamera ve sesle): renkle parlaklığı
+//! birlikte oynatmak ışıkta bulanık bir dalgaya dönüşüyor, %70–%100 parlaklık oynaması gözle
+//! seçilmiyordu; şarkıyla uyumlu hissettirmiyordu.
 //! Bluetooth kulaklıkta ses geç geldiği için bütün komutlar istenen kadar geciktirilebilir.
 //!
 //! Ses yokken loopback paket göndermez; ölçer söner. Varsayılan cihaz değişirse yenisine geçilir.
@@ -32,6 +35,7 @@ use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FO
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 
 use crate::link::Tx;
+use crate::listen;
 use crate::surucu::Cmd;
 
 /// Pencere ve kayma (örnek).
@@ -53,8 +57,10 @@ const ONSET_LAG: f64 = 0.017;
 const TEMPO_WEIGHT: [f32; 3] = [1.0, 0.6, 0.15];
 /// Bu kadar süre vuruş yoksa (sn) şarkı durmuş sayılır: ritim vuruşları da durur.
 const QUIET_S: f64 = 2.5;
-/// Komutun ışığa varma süresi: tahmin edilen vuruş bu kadar önden gönderilir.
-const LEAD: Duration = Duration::from_millis(40);
+/// Komutun ışıkta görünmesine kadar geçen süre: tahmin edilen vuruş bu kadar önden gönderilir.
+/// Bluetooth yazması, ışığın komutu işlemesi (~30 ms, `link::COLOR_SETTLE`) ve geçişinin yarısı;
+/// kamerada komuttan değişime ~130 ms (kameranın gecikmesi dahil). 70 ms'de ışık geriden geliyordu.
+const LEAD: Duration = Duration::from_millis(100);
 /// Varsayılan cihaz bu aralıkla yeniden sorulur.
 const DEVICE_CHECK: Duration = Duration::from_secs(2);
 
@@ -81,16 +87,29 @@ pub enum Kind {
     Hat,
 }
 
+/// Hangi ses dinlenir.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Listen {
+    /// Bilgisayarda çalan her şey (varsayılan çıkış).
+    All,
+    /// Yalnızca çalan Spotify ya da tarayıcı (`listen`).
+    Music,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    pub listen: Listen,
     pub react: React,
     pub source: Source,
     /// Eşik çarpanı: küçüldükçe daha hafif vuruşlar da sayılır.
     pub sensitivity: f32,
     /// Tepe parlaklık (kullanıcının parlaklığı).
     pub brightness: f32,
-    /// Işık bu kadar geciktirilir (Bluetooth kulaklıkta ses geç gelir).
-    pub delay: Duration,
+    /// Işığın zamanlaması (ms): artı geciktirir (Bluetooth kulaklıkta ses geç gelir), eksi önden
+    /// gönderir (yalnızca Ritim'de: Davul darbeyi duyduktan sonra bulur).
+    pub delay: i32,
+    /// Renk'te yer değiştiren iki renk; Flaş ilkinde yanar.
+    pub colors: [[u8; 3]; 2],
 }
 
 /// Sayfadaki ölçer için son durum.
@@ -102,6 +121,8 @@ pub struct Meter {
     pub hits: [Option<Instant>; 3],
     /// Ses geliyor mu.
     pub sound: bool,
+    /// Yalnızca müzik uygulaması dinlenirken: dinlenen uygulama.
+    pub app: Option<&'static str>,
 }
 
 pub struct Music {
@@ -207,8 +228,6 @@ pub struct Detector {
     /// Vuruş aralığı (kare) ve sonraki vuruşun ses saati.
     period: Option<f32>,
     next_beat: Option<f64>,
-    /// `next_beat`'in sıra numarası.
-    beat_no: u64,
     re: Vec<f32>,
     im: Vec<f32>,
 }
@@ -231,7 +250,6 @@ impl Detector {
             frames: 0,
             period: None,
             next_beat: None,
-            beat_no: 0,
             re: vec![0.0; N],
             im: vec![0.0; N],
         }
@@ -255,20 +273,12 @@ impl Detector {
     pub fn advance_beat(&mut self) {
         if let (Some(b), Some(p)) = (self.next_beat.as_mut(), self.period) {
             *b += (p / self.fr) as f64;
-            self.beat_no += 1;
         }
     }
 
     /// `at` vuruş ızgarasının 16'lık bir yerine yakın mı (tempo yoksa her yer yakın).
     pub fn on_grid(&self, at: f64) -> bool {
         self.near(at, 4.0, 0.045).unwrap_or(true)
-    }
-
-    /// `at` ızgaranın bir vuruşundaysa o vuruşun sıra numarası.
-    pub fn on_beat(&self, at: f64) -> Option<u64> {
-        let (b, p) = (self.next_beat?, (self.period? / self.fr) as f64);
-        let k = ((at - b) / p).round();
-        ((at - b - k * p).abs() < 0.06).then(|| (self.beat_no as i64 + k as i64).max(0) as u64)
     }
 
     /// `at`, vuruşun `div`'de birlik bölümlerinden birine `tol` saniye yakın mı.
@@ -429,25 +439,29 @@ impl Detector {
 enum Event {
     /// Ritim ızgarasının vuruşu (tahmin edilen).
     Beat,
-    /// Davul vuruşu; ızgaranın bir vuruşundaysa o vuruşun sıra numarası.
-    Hit(Kind, Option<u64>),
+    /// Davul vuruşu.
+    Hit(Kind),
 }
 
-/// Renk en çok iki vuruşta bir, palet 16 vuruşta bir değişir.
-const EVERY: u64 = 2;
-const PHRASE: u32 = 16;
+/// Tempo bilinmezken bir vuruşun süresi.
+const BEAT_GUESS: Duration = Duration::from_millis(500);
+/// Bir vuruşun bu kadarı içinde gelen ikinci darbe ışığa yansımaz (Davul'da sık darbeler).
+const MIN_BEAT_FRACTION: f32 = 0.4;
 
-/// Vuruşlara tepki: komutları zamanında gönderir. Göz yorulmasın diye renk seyrek değişir:
-/// iki vuruşta bir, paletin iki rengi arasında (Davul'da yalnızca o vuruşa bir darbe düştüyse);
-/// öbür vuruşlar yalnızca parlatır, ziller ışığa yansımaz.
+/// Vuruşlara tepki, sade: Renk'te her vuruşta seçilen iki renk yer değiştirir (yalnızca renk
+/// komutu), Flaş'ta her vuruşta tam parlar, yarım vuruşta loşa döner (yalnızca parlaklık).
+/// Renk ve parlaklığı birlikte oynatmak ışıkta yavaş, bulanık bir dalgaya dönüşüyordu (ışık
+/// renkten hemen sonra gelen parlaklıkta rengi siler; geçişleri ~100 ms sürer). Ziller ışığa
+/// yansımaz.
 struct Show {
     tx: Tx,
     cfg: Config,
-    /// Paletin tonu: iki rengi bu ton ve karşısı.
-    hue: f32,
+    /// Renk'te şu an ikinci renk mi.
     other: bool,
     color: Option<[u8; 3]>,
-    beats: u32,
+    /// Bir vuruşun süresi (tempodan) ve ışığın son vuruşa tepki verdiği an.
+    beat_len: Duration,
+    last: Option<Instant>,
     /// Bekleyen işler (gecikme ve önden gönderme için), zamana göre sıralı.
     queue: VecDeque<(Instant, Event)>,
     /// Parlamadan dönüş anı.
@@ -456,16 +470,25 @@ struct Show {
 
 impl Show {
     fn new(tx: Tx, cfg: Config) -> Self {
-        let mut s = Show { tx, cfg, hue: 0.0, other: false, color: None, beats: 0, queue: VecDeque::new(), dim_at: None };
+        let mut s = Show {
+            tx,
+            cfg,
+            other: false,
+            color: None,
+            beat_len: BEAT_GUESS,
+            last: None,
+            queue: VecDeque::new(),
+            dim_at: None,
+        };
         s.enter();
         s
     }
 
-    /// Vuruşlar arası parlaklık: Renk'te biraz kısık (vuruşta tama çıkar), Flaş'ta loş.
+    /// Vuruşlar arası parlaklık: Renk'te hep tam (parlaklık oynamaz), Flaş'ta loş.
     fn rest(&self) -> f32 {
         let b = self.cfg.brightness;
         match self.cfg.react {
-            React::Colors => b * 0.7,
+            React::Colors => b,
             React::Flash => (b * 0.12).max(0.02),
         }
     }
@@ -474,12 +497,16 @@ impl Show {
     fn enter(&mut self) {
         self.dim_at = None;
         self.color = None;
+        self.other = false;
         self.tx.send(Cmd::Brightness(self.rest()));
-        self.set_color(hsv(self.hue, 1.0));
+        self.set_color(self.cfg.colors[0]);
     }
 
     fn config(&mut self, cfg: Config) {
-        let changed = cfg.react != self.cfg.react || cfg.brightness != self.cfg.brightness || cfg.source != self.cfg.source;
+        let changed = cfg.react != self.cfg.react
+            || cfg.brightness != self.cfg.brightness
+            || cfg.source != self.cfg.source
+            || cfg.colors != self.cfg.colors;
         self.cfg = cfg;
         if changed {
             self.queue.clear();
@@ -489,7 +516,8 @@ impl Show {
 
     /// `at` anında yapılacak iş (gecikme eklenir).
     fn schedule(&mut self, at: Instant, e: Event) {
-        let at = at + self.cfg.delay;
+        let d = Duration::from_millis(self.cfg.delay.unsigned_abs() as u64);
+        let at = if self.cfg.delay >= 0 { at + d } else { at.checked_sub(d).unwrap_or(at) };
         let i = self.queue.iter().position(|(t, _)| *t > at).unwrap_or(self.queue.len());
         self.queue.insert(i, (at, e));
     }
@@ -513,49 +541,24 @@ impl Show {
         }
     }
 
-    fn pulse(&mut self, level: f32, ms: u64, now: Instant) {
-        self.tx.send(Cmd::Brightness(self.cfg.brightness * level));
-        self.dim_at = Some(now + Duration::from_millis(ms));
-    }
-
     fn play(&mut self, e: Event, now: Instant) {
-        match e {
-            Event::Beat => {
-                if (self.beats as u64).is_multiple_of(EVERY) {
-                    self.swap();
-                }
-                self.pulse(1.0, 130, now);
-            }
-            Event::Hit(kind @ (Kind::Kick | Kind::Snare), beat) => {
-                if beat.is_some_and(|b| b.is_multiple_of(EVERY)) {
-                    self.swap();
-                }
-                let on_beat = beat.is_some();
-                let (level, ms) = match (kind, on_beat) {
-                    (Kind::Kick, true) => (1.0, 140),
-                    (_, true) => (0.9, 110),
-                    _ => (0.8, 80),
-                };
-                // Ara vuruş, sürmekte olan güçlü bir parlamayı kesmez.
-                if on_beat || self.dim_at.is_none() {
-                    self.pulse(level, ms, now);
-                }
-            }
-            Event::Hit(Kind::Hat, _) => {}
+        if matches!(e, Event::Hit(Kind::Hat)) {
+            return;
         }
-    }
-
-    /// Paletin öbür rengine geçer.
-    fn swap(&mut self) {
-        self.other = !self.other;
-        self.set_color(hsv(self.hue + if self.other { 180.0 } else { 0.0 }, 1.0));
-    }
-
-    /// Palet 16 vuruşta bir ilerler (altın açıyla değil, komşu tonlara: geçiş yumuşak).
-    fn beat_passed(&mut self) {
-        self.beats += 1;
-        if self.beats.is_multiple_of(PHRASE) {
-            self.hue = (self.hue + 60.0) % 360.0;
+        // Davul'da sık darbeler (16'lıklar, çift kick) vuruşu bulandırmasın.
+        if self.last.is_some_and(|t| now - t < self.beat_len.mul_f32(MIN_BEAT_FRACTION)) {
+            return;
+        }
+        self.last = Some(now);
+        match self.cfg.react {
+            React::Colors => {
+                self.other = !self.other;
+                self.set_color(self.cfg.colors[self.other as usize]);
+            }
+            React::Flash => {
+                self.tx.send(Cmd::Brightness(self.cfg.brightness));
+                self.dim_at = Some(now + (self.beat_len / 2).clamp(Duration::from_millis(90), Duration::from_millis(300)));
+            }
         }
     }
 }
@@ -569,24 +572,55 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
         let device_id = id.to_string().unwrap_or_default();
         CoTaskMemFree(Some(id.0 as *const _));
 
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-        let format = client.GetMixFormat()?;
-        let fmt = *format;
-        let channels = fmt.nChannels.max(1) as usize;
-        let rate = fmt.nSamplesPerSec.max(1) as f32;
-        let bits = fmt.wBitsPerSample;
-        let float = bits == 32 && {
-            let tag = fmt.wFormatTag as u32;
-            tag == WAVE_FORMAT_IEEE_FLOAT
-                || (tag == WAVE_FORMAT_EXTENSIBLE
-                    && std::ptr::addr_of!((*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned() == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+        // Yalnızca müzik uygulaması: çalan Spotify ya da tarayıcı yoksa bir süre sonra yeniden bakılır.
+        let listen = cfg.lock().unwrap().listen;
+        let app = match listen {
+            Listen::All => None,
+            Listen::Music => match listen::find(&enumerator) {
+                Some(a) => Some(a),
+                None => {
+                    {
+                        let mut m = meter.lock().unwrap();
+                        *m = Meter::default();
+                    }
+                    let until = Instant::now() + DEVICE_CHECK;
+                    while Instant::now() < until && !stop.load(Ordering::Relaxed) && cfg.lock().unwrap().listen == listen {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    return Ok(());
+                }
+            },
         };
-        let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, format, None);
-        CoTaskMemFree(Some(format as *const _));
-        init?;
-        if !float && bits != 16 {
-            return Err(windows::core::Error::new(windows::core::HRESULT(-1), format!("{bits} bit ses")));
-        }
+        let (client, _event, channels, rate, float) = match app {
+            Some((pid, name)) => {
+                let (client, event) = listen::client(pid)?;
+                ortak::log!("lights: yalnızca {name} dinleniyor (süreç {pid})");
+                (client, Some(event), listen::CHANNELS as usize, listen::RATE as f32, false)
+            }
+            None => {
+                let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+                let format = client.GetMixFormat()?;
+                let fmt = *format;
+                let channels = fmt.nChannels.max(1) as usize;
+                let rate = fmt.nSamplesPerSec.max(1) as f32;
+                let bits = fmt.wBitsPerSample;
+                let float = bits == 32 && {
+                    let tag = fmt.wFormatTag as u32;
+                    tag == WAVE_FORMAT_IEEE_FLOAT
+                        || (tag == WAVE_FORMAT_EXTENSIBLE
+                            && std::ptr::addr_of!((*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned()
+                                == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+                };
+                let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, format, None);
+                CoTaskMemFree(Some(format as *const _));
+                init?;
+                if !float && bits != 16 {
+                    return Err(windows::core::Error::new(windows::core::HRESULT(-1), format!("{bits} bit ses")));
+                }
+                (client, None, channels, rate, float)
+            }
+        };
+        meter.lock().unwrap().app = app.map(|a| a.1);
         let cap: IAudioCaptureClient = client.GetService()?;
         client.Start()?;
 
@@ -605,6 +639,9 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
             let now = Instant::now();
             let c = *cfg.lock().unwrap();
             show.config(c);
+            if c.listen != listen {
+                break Ok(());
+            }
 
             if now - last_check >= DEVICE_CHECK {
                 last_check = now;
@@ -619,6 +656,10 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
                     .unwrap_or_default();
                 if current != device_id {
                     ortak::log!("lights: varsayılan ses cihazı değişti");
+                    break Ok(());
+                }
+                // Başka bir müzik uygulaması çalmaya başladı ya da dinlenen kapandı.
+                if listen == Listen::Music && listen::find(&enumerator).map(|a| a.0) != app.map(|a| a.0) {
                     break Ok(());
                 }
             }
@@ -664,24 +705,28 @@ unsafe fn capture(cfg: &Mutex<Config>, meter: &Mutex<Meter>, stop: &AtomicBool, 
                     meter.lock().unwrap().hits[hit.kind as usize] = Some(wall(hit.at));
                     // Davul: ızgaraya oturmayan zayıf vuruşlar elenir.
                     if c.source == Source::Drums && hit.kind != Kind::Hat && (hit.strength >= c.sensitivity * 4.0 || det.on_grid(hit.at)) {
-                        show.schedule(wall(hit.at), Event::Hit(hit.kind, det.on_beat(hit.at)));
+                        show.schedule(wall(hit.at), Event::Hit(hit.kind));
                     }
                 }
                 buf.drain(..HOP);
                 done += HOP as u64;
             }
-            // Ritim vuruşu: tahmin edilen an, komutun ışığa varma süresi kadar önden.
+            // Ritim vuruşu: tahmin edilen an, komutun ışığa varma süresi kadar önden (zamanlama
+            // eksiyse o kadar daha önden).
+            let early = Duration::from_millis((-c.delay).max(0) as u64);
             if let Some(b) = det.next_beat()
-                && wall(b) <= now + LEAD
+                && wall(b) <= now + LEAD + early
             {
                 if det.playing(end) {
                     if c.source == Source::Beat {
                         show.schedule(wall(b).checked_sub(LEAD).unwrap_or(now), Event::Beat);
                     }
-                    show.beat_passed();
                     meter.lock().unwrap().beat = Some(wall(b));
                 }
                 det.advance_beat();
+            }
+            if det.bpm() > 0.0 {
+                show.beat_len = Duration::from_secs_f32(60.0 / det.bpm());
             }
             show.tick(now);
 
@@ -821,7 +866,7 @@ mod tests {
     /// kilidinde takılıyor, sayfa da onu bekleyip donuyordu).
     #[test]
     fn ayar_takilmaz() {
-        let cfg = Config { react: React::Flash, source: Source::Drums, sensitivity: 1.5, brightness: 0.5, delay: Duration::ZERO };
+        let cfg = Config { listen: Listen::All, react: React::Flash, source: Source::Drums, sensitivity: 1.5, brightness: 0.5, delay: 0, colors: [[255, 0, 0], [0, 0, 255]] };
         let m = Music::start(Tx::test(), cfg);
         std::thread::sleep(Duration::from_millis(300));
         let (done, wait) = std::sync::mpsc::channel();

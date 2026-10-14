@@ -1,0 +1,121 @@
+power 1
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark R15 renk+15ms parlaklik -> YESIL
+color 0 255 0
+wait 15
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark R20 renk+20ms parlaklik -> MAVI
+color 0 0 255
+wait 20
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark R25 renk+25ms parlaklik -> YESIL
+color 0 255 0
+wait 25
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark R30 renk+30ms parlaklik -> MAVI
+color 0 0 255
+wait 30
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark CC renk+0ms renk, son YESIL
+color 0 0 255
+color 0 255 0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark CC40 renk+40ms renk, son MAVI
+color 0 255 0
+wait 40
+color 0 0 255
+wait 1500
+mark BB parlaklik 0.2 sonra 0ms 1.0, YESIL parlak
+color 0 255 0
+wait 300
+bright 0.2
+bright 1.0
+wait 1500
+mark BB2 parlaklik 1.0 sonra 0ms 0.15, YESIL los
+bright 1.0
+bright 0.15
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark M1 muzik eski sira: renk,parlaklik 0ms, nabiz 140 -> MOR
+color 140 0 255
+bright 1.0
+wait 140
+bright 0.7
+wait 140
+bright 1.0
+wait 140
+bright 0.7
+wait 140
+bright 1.0
+wait 140
+bright 0.7
+wait 1000
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark M2 muzik yeni sira: parlaklik,renk 0ms, nabiz 140 -> MOR
+bright 1.0
+color 140 0 255
+wait 140
+bright 0.7
+wait 140
+bright 1.0
+wait 140
+bright 0.7
+wait 140
+bright 1.0
+wait 140
+bright 0.7
+wait 1000
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark M3 hizli: parlaklik,renk, 50ms sonra parlaklik -> YESIL
+bright 1.0
+color 0 255 0
+wait 50
+bright 0.7
+wait 1500
+mark bitti
+color 255 255 255
+wait 800

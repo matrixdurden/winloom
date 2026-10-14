@@ -36,6 +36,8 @@ use windows::core::w;
 //   winloom --dock-test    dock'un gördüğü pencereleri ve dock'taki öğeleri yazdır
 //   winloom --dock-pin <yol>  dock'a sabitle (sağ tık menüsünden)
 //   winloom --lights-test  ışığı ara, bağlan, renkleri sırayla göster
+//   winloom --lights-pace [cevapli]  ışığın iki komut arasında ne kadar beklemesi gerektiğini dene
+//   winloom --lights-script <komutlar> <çıktı> [adres]  ışığa dosyadan komut gönder (deney)
 
 /// Bayrak İngilizce ya da Türkçe adıyla verilmiş mi.
 fn flag(args: &[String], en: &str, tr: &str) -> bool {

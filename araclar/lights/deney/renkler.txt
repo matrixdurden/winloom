@@ -1,0 +1,102 @@
+power 1
+bright 1.0
+wait 500
+mark ref KIRMIZI
+color 255 0 0
+wait 1500
+mark ref YESIL
+color 0 255 0
+wait 1500
+mark ref MAVI
+color 0 0 255
+wait 1500
+mark ref BEYAZ
+color 255 255 255
+wait 1500
+mark ref SARI
+color 255 200 0
+wait 1500
+mark ref MOR
+color 140 0 255
+wait 1500
+mark ref TURKUAZ
+color 0 220 255
+wait 1500
+mark taban beyaz
+color 255 255 255
+bright 0.6
+wait 1500
+mark A yalniz renk -> YESIL
+color 0 255 0
+wait 1500
+mark taban beyaz
+color 255 255 255
+wait 1500
+mark B renk+0ms parlaklik -> MAVI
+color 0 0 255
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark C renk+10ms parlaklik -> YESIL
+color 0 255 0
+wait 10
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark D renk+40ms parlaklik -> MAVI
+color 0 0 255
+wait 40
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark E renk+100ms parlaklik -> YESIL
+color 0 255 0
+wait 100
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark F renk+250ms parlaklik -> MAVI
+color 0 0 255
+wait 250
+bright 1.0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark G once parlaklik sonra renk 0ms -> YESIL
+bright 1.0
+color 0 255 0
+wait 1500
+mark taban beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1500
+mark H once parlaklik, 40ms, renk -> MAVI
+bright 1.0
+wait 40
+color 0 0 255
+wait 1500
+mark bitti beyaz
+bright 0.6
+wait 300
+color 255 255 255
+wait 1000

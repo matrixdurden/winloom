@@ -1,7 +1,9 @@
 //! Işıkla Bluetooth LE bağlantısı. Bütün Bluetooth işi tek bir iş parçacığında: sayfa ve müzik
 //! komutları kuyruğa atar, iş parçacığı sırayla yazar. Kuyrukta aynı türden birden çok komut
-//! birikirse (kaydırıcı sürüklenirken, müzikte) yalnızca sonuncusu gider. Bağlantının durumu
-//! değişince pencereye `WM_LINK` gelir.
+//! birikirse (kaydırıcı sürüklenirken, müzikte) yalnızca sonuncusu gider. Işık yeni rengi
+//! işlerken gelen paket rengi siler: renkten sonra `COLOR_SETTLE` beklenir, birlikte biriken
+//! parlaklık renkten önce yazılır. Bağlanmadan gelen komutlar bağlanınca gider. Bağlantının
+//! durumu değişince pencereye `WM_LINK` gelir.
 //!
 //! Bağlanmak: kayıtlı adres varsa önce doğrudan ona, olmazsa tarama (reklamdaki adı desteklenen
 //! bir modelinki olan ilk cihaz). Bağlantı `GattSession::MaintainConnection` ile açık tutulur;
@@ -27,6 +29,11 @@ pub const WM_LINK: u32 = WM_APP + 90;
 
 /// Tarama bu kadar sürer.
 const SCAN: Duration = Duration::from_secs(10);
+
+/// Renk komutundan sonra bir sonraki pakete kadar beklenen süre. STARLIGHT rengi işlerken (kamerayla
+/// ölçüldü: 25 ms'de gelen parlaklık rengi siliyor, 30 ms'de silmiyor) gelen parlaklık komutu eski
+/// rengi geri getiriyor; müzikte ışık tek renkte kalıyordu. Renk ardından renk sorun değil.
+const COLOR_SETTLE: Duration = Duration::from_millis(60);
 
 type Res<T> = Result<T, String>;
 
@@ -55,7 +62,8 @@ pub struct Status {
 enum Msg {
     Connect(Option<u64>),
     Disconnect,
-    Send(Cmd),
+    /// Komut ve kuyruğa atıldığı an (iz için).
+    Send(Cmd, Instant),
     Quit,
 }
 
@@ -65,7 +73,7 @@ pub struct Tx(Sender<Msg>);
 
 impl Tx {
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.0.send(Msg::Send(cmd));
+        let _ = self.0.send(Msg::Send(cmd, Instant::now()));
     }
 
     /// Hiçbir yere gitmeyen kopya (testler).
@@ -108,7 +116,7 @@ impl Link {
     }
 
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.tx.send(Msg::Send(cmd));
+        let _ = self.tx.send(Msg::Send(cmd, Instant::now()));
     }
 
     pub fn tx(&self) -> Tx {
@@ -134,10 +142,71 @@ fn post(hwnd: usize) {
     }
 }
 
+/// Yazma izi: `lights\iz` dosyası varsa ışığa giden her paket `lights\iz.log`'a yazılır (aradaki
+/// süre, kuyrukta bekleme, yazmanın sürdüğü, atlanan ve gidemeyen komutlar). Müzikte ışığın neyi
+/// ne aralıkla aldığını görmek için; dosya yoksa hiçbir şey yapmaz.
+struct Trace {
+    file: Option<std::fs::File>,
+    start: Instant,
+    last: Option<Instant>,
+}
+
+impl Trace {
+    fn open() -> Self {
+        let dir = crate::dir();
+        let mut file = if dir.join("iz").exists() { std::fs::File::create(dir.join("iz.log")).ok() } else { None };
+        let start = Instant::now();
+        if let Some(f) = file.as_mut() {
+            ortak::log!("lights: yazma izi açık · {}", dir.join("iz.log").display());
+            // Satırlardaki ms bu andan sayılır; duvar saati, kamera ve ses kayıtlarıyla eşleştirmek için.
+            let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            use std::io::Write;
+            let _ = writeln!(f, "# başlangıç unix_ms={:.1}", unix.as_secs_f64() * 1000.0);
+        }
+        Trace { file, start, last: None }
+    }
+
+    fn line(&mut self, at: Instant, text: &str) {
+        use std::io::Write;
+        let t = at.duration_since(self.start).as_secs_f64() * 1000.0;
+        if let Some(f) = self.file.as_mut() {
+            let _ = writeln!(f, "{t:>10.1}  {text}");
+        }
+    }
+
+    fn note(&mut self, text: &str) {
+        if self.file.is_some() {
+            self.line(Instant::now(), text);
+        }
+    }
+
+    /// `queued`: kuyruğa atıldığı an, `began`: yazmanın başladığı an.
+    fn write(&mut self, cmd: Cmd, data: &[u8], queued: Instant, began: Instant, r: &Res<()>) {
+        if self.file.is_none() {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let gap = self.last.map_or("      -".into(), |l| format!("+{:>6.1}", ms(began - l)));
+        self.last = Some(began);
+        let hex = data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        let end = match r {
+            Ok(()) => String::new(),
+            Err(e) => format!("  HATA {e}"),
+        };
+        let text = format!(
+            "{gap}  kuyruk {:>5.1}  yazma {:>5.1}  {cmd:?}  [{hex}]{end}",
+            ms(began - queued),
+            ms(began.elapsed())
+        );
+        self.line(began, &text);
+    }
+}
+
 fn worker(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, hwnd: usize) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
+    let mut trace = Trace::open();
     let set = |f: &dyn Fn(&mut Status)| {
         f(&mut status.lock().unwrap());
         post(hwnd);
@@ -145,6 +214,9 @@ fn worker(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, hwnd: usize) {
     let mut conn: Option<Conn> = None;
     // Komut toplarken gelen başka tür mesaj: sonraki turda işlenir.
     let mut next: Option<Msg> = None;
+    // Yazılmayı bekleyen komutlar (her türden en son gelen) ve son rengin yazıldığı an.
+    let mut pending: Vec<(Cmd, Instant)> = Vec::new();
+    let mut color_at: Option<Instant> = None;
     loop {
         let msg = match next.take() {
             Some(m) => m,
@@ -157,6 +229,7 @@ fn worker(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, hwnd: usize) {
             Msg::Quit => break,
             Msg::Disconnect => {
                 conn = None;
+                pending.clear();
                 set(&|s| {
                     s.state = State::Off;
                     s.error = None;
@@ -172,6 +245,14 @@ fn worker(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, hwnd: usize) {
                             *s = Status { state: State::Connected, name: name.clone(), model: Some(model), address, reachable: true, error: None }
                         });
                         ortak::log!("lights: bağlandı · {name} ({address:012X})");
+                        trace.note(&format!("bağlandı · {name}"));
+                        // Bağlanırken gelenler (müzik modunun başlangıç rengi gibi).
+                        if let Some(c) = conn.as_mut()
+                            && let Err((cmd, e)) = write_all(c, &mut pending, &mut color_at, &mut trace)
+                        {
+                            ortak::log!("lights: yazılamadı ({cmd:?}) · {e}");
+                            set(&|s| s.error = Some(e.clone()));
+                        }
                     }
                     Err(e) => {
                         ortak::log!("lights: bağlanılamadı · {e}");
@@ -182,33 +263,66 @@ fn worker(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, hwnd: usize) {
                     }
                 }
             }
-            Msg::Send(cmd) => {
-                let mut cmds = vec![cmd];
-                while let Ok(m) = rx.try_recv() {
-                    match m {
-                        Msg::Send(c) => {
-                            cmds.retain(|x| !x.same_kind(&c));
-                            cmds.push(c);
-                        }
-                        other => {
-                            next = Some(other);
-                            break;
-                        }
-                    }
+            Msg::Send(cmd, at) => {
+                queue(&mut pending, cmd, at, &mut trace);
+                drain(&rx, &mut pending, &mut next, &mut trace);
+                let Some(c) = conn.as_mut() else {
+                    trace.note(&format!("bağlı değil, bağlanınca gidecek {:?}", pending.last().map(|p| p.0)));
+                    continue;
+                };
+                // Işık son rengi işliyorsa beklenir; bu arada gelenler de birleşir.
+                let settle = color_at.map_or(Duration::ZERO, |t| COLOR_SETTLE.saturating_sub(t.elapsed()));
+                if !settle.is_zero() && next.is_none() && pending.iter().any(|(x, _)| !matches!(x, Cmd::Color(_))) {
+                    trace.note(&format!("renk oturuyor, {:.1} ms bekleniyor", settle.as_secs_f64() * 1000.0));
+                    std::thread::sleep(settle);
+                    drain(&rx, &mut pending, &mut next, &mut trace);
                 }
-                let Some(c) = conn.as_mut() else { continue };
-                for cmd in cmds {
-                    let Some(data) = (c.model.encode)(cmd) else { continue };
-                    if let Err(e) = c.write(&data) {
-                        ortak::log!("lights: yazılamadı ({cmd:?}) · {e}");
-                        set(&|s| s.error = Some(e.clone()));
-                        break;
-                    }
+                if let Err((cmd, e)) = write_all(c, &mut pending, &mut color_at, &mut trace) {
+                    ortak::log!("lights: yazılamadı ({cmd:?}) · {e}");
+                    set(&|s| s.error = Some(e.clone()));
                 }
             }
         }
     }
     drop(conn);
+}
+
+/// Bekleyenlere ekler; aynı türden bekleyen varsa yerini alır.
+fn queue(pending: &mut Vec<(Cmd, Instant)>, cmd: Cmd, at: Instant, trace: &mut Trace) {
+    if let Some(i) = pending.iter().position(|(x, _)| x.same_kind(&cmd)) {
+        let (old, _) = pending.remove(i);
+        trace.note(&format!("atlandı {old:?} (yerine {cmd:?})"));
+    }
+    pending.push((cmd, at));
+}
+
+/// Kuyrukta biriken komutları bekleyenlere alır; başka tür mesaj gelirse onu `next`'e koyup durur.
+fn drain(rx: &Receiver<Msg>, pending: &mut Vec<(Cmd, Instant)>, next: &mut Option<Msg>, trace: &mut Trace) {
+    while next.is_none()
+        && let Ok(m) = rx.try_recv()
+    {
+        match m {
+            Msg::Send(c, at) => queue(pending, c, at, trace),
+            other => *next = Some(other),
+        }
+    }
+}
+
+/// Bekleyenleri yazar; parlaklık renkten önce gider (ardından gelen parlaklık rengi siler).
+/// Hata olursa kalanlar bırakılır.
+fn write_all(c: &mut Conn, pending: &mut Vec<(Cmd, Instant)>, color_at: &mut Option<Instant>, trace: &mut Trace) -> Result<(), (Cmd, String)> {
+    pending.sort_by_key(|(cmd, _)| !matches!(cmd, Cmd::Brightness(_)));
+    for (cmd, at) in pending.drain(..) {
+        let Some(data) = (c.model.encode)(cmd) else { continue };
+        let began = Instant::now();
+        let r = c.write(&data);
+        trace.write(cmd, &data, at, began, &r);
+        r.map_err(|e| (cmd, e))?;
+        if matches!(cmd, Cmd::Color(_)) {
+            *color_at = Some(Instant::now());
+        }
+    }
+    Ok(())
 }
 
 // --- Bağlanmak ---
@@ -567,4 +681,171 @@ pub fn cli_test() -> i32 {
             1
         }
     }
+}
+
+/// `winloom --lights-pace [cevapli]`: ışık müzikteki komut akışında rengi neden kaçırıyor. Her
+/// adım loş beyazdan başlar ve ~4 saniye sürer; ekrana yalnızca adımın numarası ve ışığın hangi
+/// renkte olması gerektiği yazılır. Yanlış renkte kalan adımlar hangi akışın sorun olduğunu söyler.
+/// `cevapli`: her yazma ışığın cevabını bekler.
+pub fn cli_pace(with_response: bool) -> i32 {
+    println!("Işık aranıyor (winloom ve telefon uygulaması kapalı olmalı)…");
+    let (a, name, m) = match scan(SCAN, |_, _| {}) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            println!("Desteklenen ışık bulunamadı.");
+            return 1;
+        }
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
+    let status = Arc::new(Mutex::new(Status { model: Some(m), ..Default::default() }));
+    let mut c = match Conn::open(a, &status, 0) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Bağlanılamadı: {e}");
+            return 1;
+        }
+    };
+    if with_response {
+        c.with_response = true;
+    }
+    println!("Bağlandı: {name}. Her adımda ışığın rengine bak; yanlış renkte kalan adımların numarasını not et.\n");
+    let send = |c: &mut Conn, cmd: Cmd| {
+        if let Some(p) = (m.encode)(cmd)
+            && let Err(e) = c.write(&p)
+        {
+            println!("   (yazılamadı {cmd:?}: {e})");
+        }
+    };
+    let wait = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+    // Müzikteki gibi parlaklık nabızları: `every` ms'de bir tam / kısık, `ms` boyunca. `color`
+    // verilirse her tam nabızdan önce renk yeniden gönderilir.
+    let pulses = |c: &mut Conn, every: u64, ms: u64, color: Option<[u8; 3]>| {
+        let end = Instant::now() + Duration::from_millis(ms);
+        let mut high = true;
+        while Instant::now() < end {
+            if let Some(col) = color.filter(|_| high) {
+                send(c, Cmd::Color(col));
+            }
+            send(c, Cmd::Brightness(if high { 1.0 } else { 0.6 }));
+            high = !high;
+            wait(every);
+        }
+    };
+
+    send(&mut c, Cmd::Power(true));
+    wait(300);
+    let steps: [(&str, [u8; 3], &str); 7] = [
+        ("MAVİ", [0, 0, 255], "yalnızca renk"),
+        ("YEŞİL", [0, 255, 0], "renk, hemen ardından tek parlaklık"),
+        ("MOR", [140, 0, 255], "renk, ardından 140 ms'de bir nabız (müzikteki gibi)"),
+        ("SARI", [255, 200, 0], "renk, 400 ms bekle, sonra 140 ms'de bir nabız"),
+        ("TURKUAZ", [0, 220, 255], "renk, ardından 80 ms'de bir nabız (hızlı müzik)"),
+        ("PEMBE", [255, 0, 140], "140 ms'de bir nabız, renk her nabızda yeniden"),
+        ("TURUNCU", [255, 90, 0], "renk, ardından 300 ms'de bir nabız"),
+    ];
+    for (i, (what, color, how)) in steps.into_iter().enumerate() {
+        // Her adım loş beyazdan başlar.
+        send(&mut c, Cmd::Brightness(0.25));
+        wait(400);
+        send(&mut c, Cmd::Color([255, 255, 255]));
+        wait(1500);
+        println!("{}. {what} olmalı   ({how})", i + 1);
+        send(&mut c, Cmd::Color(color));
+        match i {
+            0 => wait(4000),
+            1 => {
+                send(&mut c, Cmd::Brightness(1.0));
+                wait(4000);
+            }
+            2 => pulses(&mut c, 140, 4000, None),
+            3 => {
+                wait(400);
+                pulses(&mut c, 140, 3600, None);
+            }
+            4 => pulses(&mut c, 80, 4000, None),
+            5 => pulses(&mut c, 140, 4000, Some(color)),
+            _ => pulses(&mut c, 300, 4000, None),
+        }
+    }
+    send(&mut c, Cmd::Brightness(0.25));
+    println!("\nBitti. Yanlış renkte kalan (beyaz kalan ya da başka renk) adımların numaraları?");
+    0
+}
+
+/// `winloom --lights-script <komutlar> <çıktı> [adres]`: ışığa satır satır komut gönderir (deney
+/// için: kamerayla ölçen betik zamanları çıktıdaki duvar saatinden eşleştirir). Satırlar:
+/// `color R G B`, `bright 0..1`, `power 0|1`, `wait ms`, `with 0|1` (cevaplı yazma), `mark ad`.
+/// Çıktının her satırı: Unix zamanı (ms) ve yapılan iş. `adres` (onaltılık) verilirse taranmaz.
+pub fn cli_script(input: &str, output: &str, address: Option<u64>) -> i32 {
+    use std::io::Write;
+    let Ok(text) = std::fs::read_to_string(input) else {
+        println!("okunamadı: {input}");
+        return 1;
+    };
+    let Ok(mut out) = std::fs::File::create(output) else {
+        println!("yazılamadı: {output}");
+        return 1;
+    };
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1000.0;
+    let mut say = |s: &str| {
+        let _ = writeln!(out, "{:.1} {s}", now());
+        let _ = out.flush();
+    };
+    let found = match address {
+        Some(a) => surucu::MODELS.first().map(|m| (a, m.name.to_string(), *m)),
+        None => match scan(SCAN, |_, _| {}) {
+            Ok(f) => f,
+            Err(e) => {
+                say(&format!("hata {e}"));
+                return 1;
+            }
+        },
+    };
+    let Some((a, _, m)) = found else {
+        say("hata ışık bulunamadı");
+        return 1;
+    };
+    let status = Arc::new(Mutex::new(Status { model: Some(m), ..Default::default() }));
+    let mut c = match Conn::open(a, &status, 0) {
+        Ok(c) => c,
+        Err(e) => {
+            say(&format!("hata bağlanılamadı {e}"));
+            return 1;
+        }
+    };
+    say("bağlandı");
+    for line in text.lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let num = |i: usize| w.get(i).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        let cmd = match w.first().copied() {
+            Some("color") => Cmd::Color([num(1) as u8, num(2) as u8, num(3) as u8]),
+            Some("bright") => Cmd::Brightness(num(1)),
+            Some("power") => Cmd::Power(num(1) != 0.0),
+            Some("wait") => {
+                std::thread::sleep(Duration::from_secs_f32(num(1) / 1000.0));
+                continue;
+            }
+            Some("with") => {
+                c.with_response = num(1) != 0.0;
+                say(&format!("cevaplı {}", c.with_response));
+                continue;
+            }
+            Some("mark") => {
+                say(&format!("mark {}", w[1..].join(" ")));
+                continue;
+            }
+            _ => continue,
+        };
+        let Some(p) = (m.encode)(cmd) else { continue };
+        let t = Instant::now();
+        match c.write(&p) {
+            Ok(()) => say(&format!("{cmd:?} yazma {:.1} ms", t.elapsed().as_secs_f64() * 1000.0)),
+            Err(e) => say(&format!("{cmd:?} HATA {e}")),
+        }
+    }
+    say("bitti");
+    0
 }

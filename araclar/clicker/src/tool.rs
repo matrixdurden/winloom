@@ -5,9 +5,15 @@ use ortak::tool::Tool;
 pub static TOOL: Tool = Tool {
     id: "clicker",
     names: ["Clicker", "Tıklayıcı"],
-    tagline: ["Clicks for you while you hold a key", "Tuşu basılı tuttuğun sürece senin yerine tıklar"],
+    tagline: [
+        "Any number of keys: each clicks, scrolls or types for you",
+        "İstediğin kadar tuş: her biri senin yerine tıklar, kaydırır ya da tuşa basar",
+    ],
     note: ["No internet needed", "İnternet gerekmez"],
-    off_note: ["Its trigger key is released and its settings are deleted.", "Tetik tuşu bırakılır, ayarları silinir."],
+    off_note: [
+        "Its trigger keys are released and its settings are deleted.",
+        "Tetik tuşları bırakılır, ayarları silinir.",
+    ],
     glyph: "\u{E962}",
     icons: ortak::icons!("clicker"),
     installed: crate::installed,

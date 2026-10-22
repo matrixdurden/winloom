@@ -3,7 +3,7 @@ name = "clicker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "winloom aracı · Tıklayıcı: tuşu basılı tuttuğun sürece tıklar"
+description = "winloom aracı · Tıklayıcı: istediğin kadar tetik tuşu, her biri tıklar, kaydırır ya da tuşa basar"
 
 [dependencies]
 ortak.workspace = true

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/tr/banner.png" alt="winloom: Windows araçların tek uygulamada" width="100%">
+  <img src="docs/tr/banner-winloom.png" alt="winloom: Windows araçların tek uygulamada" width="100%">
 </p>
 
 <p align="center">
@@ -70,8 +70,8 @@ Bütün araçlar winloom ile gelir ve kapalı başlar. **Araçlar** sayfasından
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/tr/tools.png" alt="Araçlar sayfası"></td>
-    <td width="50%"><img src="docs/tr/wallpaper.png" alt="Duvar kâğıdı sayfası"></td>
+    <td width="50%"><img src="docs/tr/page-tools.png" alt="Araçlar sayfası"></td>
+    <td width="50%"><img src="docs/tr/page-wallpaper.png" alt="Duvar kâğıdı sayfası"></td>
   </tr>
   <tr>
     <td align="center"><sub>Araçlar: her araç tek anahtar</sub></td>

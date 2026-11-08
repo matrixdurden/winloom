@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="winloom: your Windows tools in one app" width="100%">
+  <img src="docs/banner-winloom.png" alt="winloom: your Windows tools in one app" width="100%">
 </p>
 
 <p align="center">
@@ -70,8 +70,8 @@ Every tool ships with winloom and starts off. Turn on the ones you want on the *
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/tools.png" alt="The Tools page"></td>
-    <td width="50%"><img src="docs/wallpaper.png" alt="The Wallpaper page"></td>
+    <td width="50%"><img src="docs/page-tools.png" alt="The Tools page"></td>
+    <td width="50%"><img src="docs/page-wallpaper.png" alt="The Wallpaper page"></td>
   </tr>
   <tr>
     <td align="center"><sub>Tools: every tool, one switch each</sub></td>
